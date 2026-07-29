@@ -4,6 +4,7 @@ from streamlit_autorefresh import st_autorefresh
 import numpy as np
 import requests
 import os
+import time
 from datetime import datetime, timezone
 import plotly.graph_objects as go
 
@@ -32,7 +33,8 @@ SYMBOL = 'BTCUSDT'
 # ==========================================
 def fetch_binance_klines(start_ts=None, limit=1000):
     """Binanceから日足データを取得"""
-    url = "https://api.binance.com/api/v3/klines"
+    # USサーバーからのアクセスブロックを回避
+    url = "https://api.binance.us/api/v3/klines"
     params = {"symbol": SYMBOL, "interval": "1d", "limit": limit}
     if start_ts:
         params["startTime"] = int(start_ts)
@@ -41,7 +43,7 @@ def fetch_binance_klines(start_ts=None, limit=1000):
     return res.json()
 
 def format_klines(raw_data):
-    """APIの生データをDataFrameに変換"""
+    # (ここは変更なし)
     df = pd.DataFrame(raw_data, columns=[
         'Open_time', 'Open', 'High', 'Low', 'Close', 'Volume',
         'Close_time', 'Quote_asset_volume', 'Number_of_trades',
@@ -56,7 +58,7 @@ def format_klines(raw_data):
 def load_and_update_data():
     """CSVの読み込み、不足分の取得、またはゼロからの完全復旧"""
     if not os.path.exists(CSV_FILE):
-        st.warning("⚠️ ローカルデータが見つかりません。2017年からの全データを取得して復旧します...")
+        st.warning("⚠️ ローカルデータが見つかりません。全データを取得して復旧します...")
         start_ts = 1502928000000 # Binance BTCUSDT開始時期 (2017-08)
         all_data = []
         while True:
@@ -65,6 +67,7 @@ def load_and_update_data():
             all_data.extend(data)
             start_ts = data[-1][0] + 1 # 最後のデータの次のミリ秒
             if len(data) < 1000: break
+            time.sleep(0.5) # 0.5秒待機してAPIの連続アクセス制限を回避
         df = format_klines(all_data)
         df.to_csv(CSV_FILE)
         return df
@@ -89,7 +92,8 @@ def load_and_update_data():
 
 def get_realtime_price():
     """現在のリアルタイム価格を取得"""
-    url = f"https://api.binance.com/api/v3/ticker/price?symbol={SYMBOL}"
+    # .com を .us に変更
+    url = f"https://api.binance.us/api/v3/ticker/price?symbol={SYMBOL}"
     res = requests.get(url)
     return float(res.json()['price'])
 
@@ -224,7 +228,7 @@ for i in range(len(df_history)):
 # ループを抜け、現在（最新日）のポジションが確定
 current_core_pct = current_base * 100
 current_long_pct = target_long * 100
-current_short_pct = current_short * 100 # ★target_short から current_short に変更
+current_short_pct = current_short * 100
 
 if current_long_pct > 0:
     overlay_status = f"🔵 LONG ({current_long_pct:.1f}%)"
