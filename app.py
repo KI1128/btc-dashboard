@@ -131,7 +131,11 @@ df_history['slope_30'] = df_history['MA_30'].diff()
 
 current_base = 1.0  
 current_short = 0.0
-is_short_mode_under_100 = False 
+is_short_mode_under_100 = False
+short_hold_days = 0 
+long_active = False
+days_since_long_exit = 999
+long_penalty = False
 
 # バックテスト用の履歴リスト
 core_weights = []
@@ -145,6 +149,12 @@ latest_cond_buy_gradual = False
 latest_cond_sell_gradual = False
 latest_short_cond_100 = False
 latest_c_close = latest_c_7 = latest_c_30 = latest_c_90 = latest_c_365 = latest_c_1460 = 0.0
+
+# --- オーバーレイの詳細ステータス保存用 ---
+latest_long_penalty = False
+latest_days_since_long_exit = 0
+latest_short_hold_days = 0
+latest_long_signal = False
 
 for i in range(len(df_history)):
     c_close = df_history['Close'].iloc[i]
@@ -195,14 +205,57 @@ for i in range(len(df_history)):
             short_cond_100 = (slope_30 < 0) and (slope_7 < 0) and ((slope_30 - slope_7) > 0) and (c_close < c_90)
             if i == len(df_history) - 1: latest_short_cond_100 = short_cond_100
             
-            if short_cond_100:
+            # --- ショートの7日間強制解除 ---
+            if short_cond_100 and short_hold_days < 7:
                 ideal_short = cap * 0.25
-                target_long = 0.0
+                short_hold_days += 1
             else:
                 ideal_short = 0.0
-                target_long = cap * 1.0 
+                # ショート条件自体が否定された場合のみ日数をリセット
+                if not short_cond_100:
+                    short_hold_days = 0
+            
             current_short = ideal_short
+
+            # --- ロングのペナルティ（お預け）判定と特例 ---
+            if ideal_short > 0.0:
+                long_penalty = False
+
+            strong_bull = (c_7 > c_30) and (c_30 > c_90)
+            if strong_bull:
+                long_penalty = False 
+
+            long_signal = (ideal_short == 0.0) and (c_7 > c_30)
+            is_long_active_today = False
+
+            if long_signal:
+                if not long_active:
+                    if (days_since_long_exit <= 7) and not strong_bull:
+                        long_penalty = True
+                
+                if not long_penalty:
+                    target_long = cap * 1.0
+                    is_long_active_today = True
+                else:
+                    target_long = 0.0
+            else:
+                target_long = 0.0
+            
+            # 状態の更新
+            if long_active and not is_long_active_today:
+                days_since_long_exit = 0  
+            elif not is_long_active_today:
+                days_since_long_exit += 1 
+                
+            long_active = is_long_active_today
+
         else:
+            # 現物100%状態を抜けたら念のため各タイマーとフラグをリセット
+            short_hold_days = 0 
+            long_active = False
+            days_since_long_exit = 999
+            long_penalty = False
+            
             if i == len(df_history) - 1: latest_short_cond_100 = False
             if sell_flag: is_short_mode_under_100 = True
             if buyback_flag: is_short_mode_under_100 = False
@@ -216,6 +269,13 @@ for i in range(len(df_history)):
     core_weights.append(current_base)
     long_weights.append(target_long)
     short_weights.append(current_short)
+    
+    # 最終日の詳細ステータスをUI向けに保存 ---
+    if i == len(df_history) - 1:
+        latest_long_penalty = long_penalty
+        latest_days_since_long_exit = days_since_long_exit
+        latest_short_hold_days = short_hold_days
+        latest_long_signal = (ideal_short == 0.0) and (c_7 > c_30) if current_base == 1.0 else False
 
 # バックテストリターン計算
 df_history['Core_Weight'] = core_weights
@@ -344,18 +404,28 @@ with tab1:
     # -----------------------------------
     st.markdown("##### 🚀 Overlay (Long/Short) ポジション")
     if current_base == 1.0:
-        if latest_short_cond_100:
-            st.warning("📉【ヘッジ発動】現物は100%ですが、短期的な下落サインを検知しました。ロングを解除し、ショートヘッジを展開中です。")
+        if current_short > 0:
+            if latest_short_cond_100:
+                st.warning(f"📉【ヘッジ発動】現物は100%ですが、短期的な下落サインを検知しました。ショートヘッジを展開中です。（強制保持: {latest_short_hold_days}/7日）")
+            else:
+                st.warning(f"📉【ヘッジ維持】下落サインは消滅しましたが、7日間強制保持ルールによりショートを維持しています。（強制保持: {latest_short_hold_days}/7日）")
+                
             if short_dissolution_danger:
                 st.warning(f"⚠️【警戒】ショート解除条件のいずれかが境界価格から1%(MA90は5%)以内に接近しています。トレンドが好転し、再度ロングへ転換する可能性があります。")
             else:
                 st.info("ℹ️ ショート解除条件（4つのうちいずれかの上抜け）からは十分な距離があります。")
         else:
-            st.success("🟢【ロング】上昇トレンド継続中です。ショートを解除し、ロング（追撃）ポジションを最大展開しています。")
-            if short_initiation_danger:
-                st.warning(f"⚠️【警戒】すべてのショート発動条件（MAの傾き悪化＋MA90割れ）が境界価格から1%(MA90は5%)以内に迫っています。急落によるロング強制解除に強く警戒してください。")
+            if current_long_pct > 0:
+                st.success("🟢【ロング】上昇トレンド継続中です。ショートを解除し、ロング（追撃）ポジションを展開しています。")
+                if short_initiation_danger:
+                    st.warning(f"⚠️【警戒】すべてのショート発動条件（MAの傾き悪化＋MA90割れ）が境界価格から1%(MA90は5%)以内に迫っています。急落によるロング強制解除に強く警戒してください。")
+                else:
+                    st.info("ℹ️ ショート発動条件のすべてが同時に満たされるまでには、まだ十分な距離があります。")
             else:
-                st.info("ℹ️ ショート発動条件のすべてが同時に満たされるまでには、まだ十分な距離があります。")
+                if latest_long_signal and latest_long_penalty:
+                    st.info(f"⏳【ロング待機 (ペナルティ)】ロング条件は成立していますが、ダマシ回避のため解除後7日間のペナルティ期間中です。エントリーを保留しています。（経過: {latest_days_since_long_exit}日）")
+                else:
+                    st.info("⚪【ニュートラル】ショート条件は非成立ですが、ロング条件(MA7 > MA30)も満たしていないため、オーバーレイは現在フラット（ポジションなし）です。")
     else:
         if is_short_mode_under_100:
             st.warning("📉【ショート展開】現物ポジション縮小に伴い、下落ヘッジのためのショートポジションを構築・維持しています。")
