@@ -7,6 +7,9 @@ import os
 import time
 from datetime import datetime, timezone
 import plotly.graph_objects as go
+import streamlit.components.v1 as components
+from tradingview_ta import TA_Handler, Interval
+
 
 # ==========================================
 # 1. 設定 & 定数
@@ -15,9 +18,22 @@ st.set_page_config(page_title="BTC Strategy Dashboard", layout="wide")
 
 st.markdown("""
     <style>
+        /* 全体の上下余白をさらに狭く */
         .block-container {
             padding-top: 1rem;
             padding-bottom: 0rem;
+        }
+        /* 見出しとメトリクスの間の余白を狭く */
+        h3 {
+            padding-bottom: 0rem !important;
+            margin-bottom: 0rem !important;
+        }
+        /* st.metric（数値表示部分）のサイズを少し小さくコンパクトに */
+        [data-testid="stMetricValue"] {
+            font-size: 1.8rem !important;
+        }
+        [data-testid="stMetricLabel"] {
+            font-size: 0.9rem !important;
         }
     </style>
 """, unsafe_allow_html=True)
@@ -84,6 +100,38 @@ def get_realtime_price():
     res = requests.get(url)
     return float(res.json()['price'])
 
+@st.cache_data(ttl=900)  # 15分間キャッシュしてAPIの負荷を軽減
+def fetch_external_market_context():
+    context_data = {}
+    
+    # ① TradingView テクニカル分析の自動取得
+    try:
+        btc_ta = TA_Handler(
+            symbol="BTCUSDT",
+            screener="crypto",
+            exchange="BINANCE",
+            interval=Interval.INTERVAL_1_DAY
+        )
+        analysis = btc_ta.get_analysis()
+        context_data['tradingview'] = {
+            "summary": analysis.summary,  # 例: {"RECOMMENDATION": "BUY", "BUY": 11, "SELL": 5, "NEUTRAL": 10}
+        }
+    except Exception as e:
+        context_data['tradingview'] = {"error": str(e)}
+
+    # ② Fear & Greed Index (市場の空気感) の自動取得
+    try:
+        fng_res = requests.get("https://api.alternative.me/fng/?limit=1").json()
+        fng_data = fng_res['data'][0]
+        context_data['fear_and_greed'] = {
+            "score": int(fng_data['value']),  # 0(極端な恐怖) 〜 100(極端な強欲)
+            "classification": fng_data['value_classification']
+        }
+    except Exception as e:
+        context_data['fear_and_greed'] = {"error": str(e)}
+        
+    return context_data
+
 # ==========================================
 # 3. 指標計算 & 戦略状態のシミュレーション
 # ==========================================
@@ -115,6 +163,7 @@ def calc_kpi(returns_series):
 with st.spinner("データを同期中..."):
     df_history = load_and_update_data()
     current_price = get_realtime_price()
+    ext_context = fetch_external_market_context()
 
 today = pd.Timestamp(datetime.now(timezone.utc).date())
 if today in df_history.index:
@@ -347,112 +396,157 @@ short_initiation_danger = warn_slope7_down and warn_slope30_down and warn_diff_d
 # ==========================================
 st.title("🚀 BTC Strategy Dashboard")
 
-tab1, tab2, tab3 = st.tabs(["📊 ダッシュボード", "📈 チャート", "🧪 戦術バックテスト"])
+tab1, tab2, tab3, tab4 = st.tabs(["📊 ダッシュボード", "📈 チャート", "🧪 戦術バックテスト", "🤖 データ出力"])
 
 # --- タブ1: ダッシュボード ---
 with tab1:
-    st.markdown("### 現在の推奨アクション")
+    st.write("表示設定:")
+    col_t1, col_t2, col_t3 = st.columns(3)
+    with col_t1:
+        show_action = st.toggle("推奨アクション", value=True)
+    with col_t2:
+        show_alert = st.toggle("アラート・モニター", value=True)
+    with col_t3:
+        show_tv = st.toggle("マーケット判定 (TradingView)", value=True)
     
-    prev_price = df_history['Close'].iloc[-2] if len(df_history) > 1 else current_price
-    price_diff = current_price - prev_price
-    price_pct = (price_diff / prev_price) * 100 if prev_price != 0 else 0
-
-    col1, col2, col3 = st.columns(3)
-    col1.metric("リアルタイム BTC価格", f"${current_price:,.2f}", f"{price_diff:+,.2f} ({price_pct:+.2f}%)")
-    col2.metric(f"Core (現物): {current_core_pct:.0f}%", latest_core_action, delta_color="off")
-    col3.metric("Overlay (Long/Short)", overlay_status)
-
     st.markdown("---")
-    st.subheader("⚠️ 24時間 アラート・モニター")
-    
-    # -----------------------------------
-    # 1. ベース（現物）戦略のアラート
-    # -----------------------------------
-    st.markdown("##### 📦 Core (現物) ポジション")
-    if latest_cond_perfect_bull:
-        st.success("✅【安全】現在、強気のパーフェクトオーダーが成立しています。現物100%ホールド推奨です。")
-        if abs(dist_7_30) <= 5.0:
-            st.warning(f"⚠️【警戒】MA7がMA30をデッドクロスする価格（${trigger_7_30:,.0f} / 残り {abs(dist_7_30):.1f}%）に接近しています。5%以内のためパーフェクトオーダー崩壊に警戒してください。")
-        else:
-            st.info(f"ℹ️ パーフェクトオーダー崩壊ライン（MA7 vs MA30）は ${trigger_7_30:,.0f}（距離: {abs(dist_7_30):.1f}%）です。")
-            
-    elif latest_cond_perfect_bear:
-        st.error("🚨【危険】現在、弱気のパーフェクトオーダーが成立しています。現物0%（全キャッシュ化）推奨です。")
-        if abs(dist_7_30) <= 5.0:
-             st.warning(f"⚠️【警戒】下落トレンド脱出ライン（MA7 vs MA30）まで残り {abs(dist_7_30):.1f}% です。")
-        else:
-             st.info(f"ℹ️ 下落トレンド脱出ライン（MA7 vs MA30）は ${trigger_7_30:,.0f}（距離: {abs(dist_7_30):.1f}%）です。")
-             
-    elif latest_cond_buy_gradual:
-        st.info(f"ℹ️【買い集め】MA(7) < MA(1460) が成立中。毎日1%ずつ現物を買い集めるフェーズです。")
-        if abs(dist_7_1460) <= 5.0:
-            st.warning(f"⚠️【接近中】MA7がMA1460を上抜ける大局的な転換価格（${trigger_7_1460:,.0f} / 残り {abs(dist_7_1460):.1f}%）に接近しています。5%以内のため注視してください。")
-        else:
-            st.info(f"ℹ️ 買い集めフェーズ終了ライン（MA7 vs MA1460）は ${trigger_7_1460:,.0f}（距離: {abs(dist_7_1460):.1f}%）です。")
-            
-    elif latest_cond_sell_gradual:
-        st.warning("⚠️【段階的売却】下落トレンドの初期症状を検知しました。毎日3%ずつ現物を段階的に売却するフェーズです。")
-        if abs(dist_7_30) <= 5.0:
-             st.warning(f"⚠️【警戒】トレンド好転の目安となるライン（MA7 vs MA30）まで残り {abs(dist_7_30):.1f}% です。")
-        else:
-             st.info(f"ℹ️ トレンド好転の目安となるライン（MA7 vs MA30）は ${trigger_7_30:,.0f}（距離: {abs(dist_7_30):.1f}%）です。")
-    else:
-        st.success("✅【待機】現在、条件移行の主要トリガーラインからの距離は十分にあります。現状維持です。")
 
-    # -----------------------------------
-    # 2. オーバーレイ（Long/Short）戦略のアラート
-    # -----------------------------------
-    st.markdown("##### 🚀 Overlay (Long/Short) ポジション")
-    if current_base == 1.0:
-        if current_short > 0:
-            st.warning(f"🔄【ショート償却中】現物は100%に復帰しましたが、過去の残存ショートポジションを緩やかに償却中です。（残り: {current_short_pct:.1f}%）")
-            
-        if latest_short_cond_100 or latest_short_hold_days > 0:
-            st.info(f"ℹ️【内部シグナル】短期的な下落サインを検知しています（ロング制御用・実ショートなし / タイマー: {latest_short_hold_days}/7日）。")
-            
-        if current_long_pct > 0:
-            if current_short > 0:
-                st.success(f"🟢【ロング (制限中)】上昇トレンド継続中ですが、ショート償却中のためロングは 50% に制限されています。")
+    # 1. 現在の推奨アクション (スイッチがONの時だけ表示)
+    if show_action:
+        st.markdown("### 現在の推奨アクション")
+        
+        prev_price = df_history['Close'].iloc[-2] if len(df_history) > 1 else current_price
+        price_diff = current_price - prev_price
+        price_pct = (price_diff / prev_price) * 100 if prev_price != 0 else 0
+
+        col1, col2, col3 = st.columns(3)
+        col1.metric("リアルタイム BTC価格", f"${current_price:,.2f}", f"{price_diff:+,.2f} ({price_pct:+.2f}%)")
+        col2.metric(f"Core (現物): {current_core_pct:.0f}%", latest_core_action, delta_color="off")
+        col3.metric("Overlay (Long/Short)", overlay_status)
+        
+        st.markdown("---")
+
+    # 2. 24時間 アラート・モニター (スイッチがONの時だけ表示)
+    if show_alert:
+        st.subheader("⚠️ 24時間 アラート・モニター")
+        
+        # -----------------------------------
+        # ベース（現物）戦略のアラート
+        # -----------------------------------
+        st.markdown("##### 📦 Core (現物) ポジション")
+        if latest_cond_perfect_bull:
+            st.success("✅【安全】現在、強気のパーフェクトオーダーが成立しています。現物100%ホールド推奨です。")
+            if abs(dist_7_30) <= 5.0:
+                st.warning(f"⚠️【警戒】MA7がMA30をデッドクロスする価格（${trigger_7_30:,.0f} / 残り {abs(dist_7_30):.1f}%）に接近しています。5%以内のためパーフェクトオーダー崩壊に警戒してください。")
             else:
-                st.success(f"🟢【ロング (フル展開)】上昇トレンド継続中です。ショートが完全にゼロになったため、ロングを 100% フルで展開しています。")
+                st.info(f"ℹ️ パーフェクトオーダー崩壊ライン（MA7 vs MA30）は ${trigger_7_30:,.0f}（距離: {abs(dist_7_30):.1f}%）です。")
                 
-            if short_initiation_danger:
-                st.warning(f"⚠️【警戒】すべてのショート発動条件（MAの傾き悪化＋MA90割れ）が境界価格から1%(MA90は5%)以内に迫っています。急落によるロング強制解除に強く警戒してください。")
-        else:
-            if latest_long_signal and latest_long_penalty:
-                st.info(f"⏳【ロング待機 (ペナルティ)】ロング条件は成立していますが、ダマシ回避のため解除後7日間のペナルティ期間中です。エントリーを保留しています。（経過: {latest_days_since_long_exit}日）")
+        elif latest_cond_perfect_bear:
+            st.error("🚨【危険】現在、弱気のパーフェクトオーダーが成立しています。現物0%（全キャッシュ化）推奨です。")
+            if abs(dist_7_30) <= 5.0:
+                 st.warning(f"⚠️【警戒】下落トレンド脱出ライン（MA7 vs MA30）まで残り {abs(dist_7_30):.1f}% です。")
             else:
-                st.info("⚪【ニュートラル】ロング条件(MA7 > MA30)を満たしていないため、オーバーレイは現在フラット（ポジションなし）です。")
-    else:
-        if is_short_mode_under_100:
-            st.warning("📉【ショート展開】下落トレンド入りに伴い、下落ヘッジのためのショートポジションを最大100%まで期間をかけて構築・維持しています。")
+                 st.info(f"ℹ️ 下落トレンド脱出ライン（MA7 vs MA30）は ${trigger_7_30:,.0f}（距離: {abs(dist_7_30):.1f}%）です。")
+                 
+        elif latest_cond_buy_gradual:
+            st.info(f"ℹ️【買い集め】MA(7) < MA(1460) が成立中。毎日1%ずつ現物を買い集めるフェーズです。")
             if abs(dist_7_1460) <= 5.0:
-                st.warning(f"⚠️【警戒】買い戻し条件（MA7がMA1460を上抜ける）まで残り {abs(dist_7_1460):.1f}% です。ショートが解消モードに移行する可能性があります。")
+                st.warning(f"⚠️【接近中】MA7がMA1460を上抜ける大局的な転換価格（${trigger_7_1460:,.0f} / 残り {abs(dist_7_1460):.1f}%）に接近しています。5%以内のため注視してください。")
+            else:
+                st.info(f"ℹ️ 買い集めフェーズ終了ライン（MA7 vs MA1460）は ${trigger_7_1460:,.0f}（距離: {abs(dist_7_1460):.1f}%）です。")
+                
+        elif latest_cond_sell_gradual:
+            st.warning("⚠️【段階的売却】下落トレンドの初期症状を検知しました。毎日3%ずつ現物を段階的に売却するフェーズです。")
+            if abs(dist_7_30) <= 5.0:
+                 st.warning(f"⚠️【警戒】トレンド好転の目安となるライン（MA7 vs MA30）まで残り {abs(dist_7_30):.1f}% です。")
+            else:
+                 st.info(f"ℹ️ トレンド好転の目安となるライン（MA7 vs MA30）は ${trigger_7_30:,.0f}（距離: {abs(dist_7_30):.1f}%）です。")
         else:
-            st.info("🔄【ショート償却】買い戻し条件が成立したため、ショートポジションを徐々に縮小・償却しています。")
+            st.success("✅【待機】現在、条件移行の主要トリガーラインからの距離は十分にあります。現状維持です。")
 
-    st.markdown("#### 🔍 各指標・条件判定の一覧")
-    status_df = pd.DataFrame({
-        "指標・条件": [
-            "現在価格", "MA(7)", "MA(30)", "MA(90)", "MA(365)", "MA(1460)",
-            "超強気フェーズ (MA1460<365<90<30<7)",
-            "超弱気フェーズ (MA7<30<90<365<1460)",
-            "買い集めフェーズ (MA7 < MA1460)",
-            "売却・ロング禁止フェーズ (MA1460 < MA7/30 < 365 < 90)",
-            "ショート移行条件成立（現物100%時はロング解除シグナル）"
-        ],
-        "数値・ステータス": [
-            f"${latest_c_close:,.2f}", f"${latest_c_7:,.2f}", f"${latest_c_30:,.2f}", 
-            f"${latest_c_90:,.2f}", f"${latest_c_365:,.2f}", f"${latest_c_1460:,.2f}",
-            "🟢 成立" if latest_cond_perfect_bull else "❌ 不成立",
-            "🔴 成立" if latest_cond_perfect_bear else "❌ 不成立",
-            "🟡 成立" if latest_cond_buy_gradual else "❌ 不成立",
-            "🟠 成立" if latest_cond_sell_gradual else "❌ 不成立",
-            "🔴 成立" if is_short_mode_under_100 or latest_short_cond_100 else "❌ 不成立"
-        ]
-    })
-    st.table(status_df)
-    
+        # -----------------------------------
+        # オーバーレイ（Long/Short）戦略のアラート
+        # -----------------------------------
+        st.markdown("##### 🚀 Overlay (Long/Short) ポジション")
+        if current_base == 1.0:
+            if current_short > 0:
+                st.warning(f"🔄【ショート償却中】現物は100%に復帰しましたが、過去の残存ショートポジションを緩やかに償却中です。（残り: {current_short_pct:.1f}%）")
+                
+            if latest_short_cond_100 or latest_short_hold_days > 0:
+                st.info(f"ℹ️【内部シグナル】短期的な下落サインを検知しています（ロング制御用・実ショートなし / タイマー: {latest_short_hold_days}/7日）。")
+                
+            if current_long_pct > 0:
+                if current_short > 0:
+                    st.success(f"🟢【ロング (制限中)】上昇トレンド継続中ですが、ショート償却中のためロングは 50% に制限されています。")
+                else:
+                    st.success(f"🟢【ロング (フル展開)】上昇トレンド継続中です。ショートが完全にゼロになったため、ロングを 100% フルで展開しています。")
+                    
+                if short_initiation_danger:
+                    st.warning(f"⚠️【警戒】すべてのショート発動条件（MAの傾き悪化＋MA90割れ）が境界価格から1%(MA90は5%)以内に迫っています。急落によるロング強制解除に強く警戒してください。")
+            else:
+                if latest_long_signal and latest_long_penalty:
+                    st.info(f"⏳【ロング待機 (ペナルティ)】ロング条件は成立していますが、ダマシ回避のため解除後7日間のペナルティ期間中です。エントリーを保留しています。（経過: {latest_days_since_long_exit}日）")
+                else:
+                    st.info("⚪【ニュートラル】ロング条件(MA7 > MA30)を満たしていないため、オーバーレイは現在フラット（ポジションなし）です。")
+        else:
+            if is_short_mode_under_100:
+                st.warning("📉【ショート展開】下落トレンド入りに伴い、下落ヘッジのためのショートポジションを最大100%まで期間をかけて構築・維持しています。")
+                if abs(dist_7_1460) <= 5.0:
+                    st.warning(f"⚠️【警戒】買い戻し条件（MA7がMA1460を上抜ける）まで残り {abs(dist_7_1460):.1f}% です。ショートが解消モードに移行する可能性があります。")
+            else:
+                st.info("🔄【ショート償却】買い戻し条件が成立したため、ショートポジションを徐々に縮小・償却しています。")
+
+        # 各指標の折りたたみ表
+        with st.expander("🔍 各指標・条件判定の詳細データを見る", expanded=False):
+            status_df = pd.DataFrame({
+                "指標・条件": [
+                    "現在価格", "MA(7)", "MA(30)", "MA(90)", "MA(365)", "MA(1460)",
+                    "超強気フェーズ (MA1460<365<90<30<7)",
+                    "超弱気フェーズ (MA7<30<90<365<1460)",
+                    "買い集めフェーズ (MA7 < MA1460)",
+                    "売却・ロング禁止フェーズ (MA1460 < MA7/30 < 365 < 90)",
+                    "ショート移行条件成立（現物100%時はロング解除シグナル）"
+                ],
+                "数値・ステータス": [
+                    f"${latest_c_close:,.2f}", f"${latest_c_7:,.2f}", f"${latest_c_30:,.2f}", 
+                    f"${latest_c_90:,.2f}", f"${latest_c_365:,.2f}", f"${latest_c_1460:,.2f}",
+                    "🟢 成立" if latest_cond_perfect_bull else "❌ 不成立",
+                    "🔴 成立" if latest_cond_perfect_bear else "❌ 不成立",
+                    "🟡 成立" if latest_cond_buy_gradual else "❌ 不成立",
+                    "🟠 成立" if latest_cond_sell_gradual else "❌ 不成立",
+                    "🔴 成立" if is_short_mode_under_100 or latest_short_cond_100 else "❌ 不成立"
+                ]
+            })
+            st.table(status_df)
+            
+        st.markdown("---")
+
+    # 3. マーケット総合判定 (TradingView) (スイッチがONの時だけ表示)
+    if show_tv:
+        st.subheader("📈 マーケット総合判定 (TradingView)")
+        
+        tv_widget = """
+        <!-- TradingView Widget BEGIN -->
+        <div class="tradingview-widget-container">
+          <div class="tradingview-widget-container__widget"></div>
+          <script type="text/javascript" src="https://s3.tradingview.com/external-embedding/embed-widget-technical-analysis.js" async>
+          {
+          "interval": "1D",
+          "width": "100%",
+          "isTransparent": false,
+          "height": "500",
+          "symbol": "BINANCE:BTCUSDT",
+          "showIntervalTabs": true,
+          "displayMode": "multiple",
+          "locale": "ja",
+          "colorTheme": "light"
+        }
+          </script>
+        </div>
+        <!-- TradingView Widget END -->
+        """
+        components.html(tv_widget, height=520, scrolling=True)
+
     if st.button("🔄 リアルタイムデータを更新"):
         st.rerun()
 
@@ -515,7 +609,9 @@ with tab3:
         "MDD (%)": [f"{hodl_mdd:.2f}%", f"{core_mdd:.2f}%", f"{long_mdd:.2f}%", f"{short_mdd:.2f}%", f"{total_mdd:.2f}%"],
         "カルマーレシオ": [f"{hodl_cal:.2f}", f"{core_cal:.2f}", f"{long_cal:.2f}", f"{short_cal:.2f}", f"{total_cal:.2f}"]
     }
-    st.table(pd.DataFrame(kpi_data).set_index("戦略"))
+    
+    with st.expander("📊 パフォーマンス指標 (KPI) の詳細データを見る", expanded=False):
+        st.table(pd.DataFrame(kpi_data).set_index("戦略"))
     
     # 各戦略の累積資産推移を計算
     df_bt['HODL_Cum'] = (1 + df_bt['BTC_Return']).cumprod()
@@ -540,3 +636,74 @@ with tab3:
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
     )
     st.plotly_chart(fig_bt, use_container_width=True)
+
+# --- タブ4: AI分析用データエクスポート ---
+with tab4:
+    st.subheader("🤖 分析用プロンプト生成")
+    st.write("以下のテキストをコピーしてAIに渡すだけで、市場の空気感を含めた高度な分析が完了します。")
+    
+    import json
+    
+    # AIが読み取りやすいように全データをJSONにまとめる
+    ai_data = {
+        "market_data": {
+            "symbol": "BTCUSDT",
+            "current_price": float(round(current_price, 2)),
+            "price_change_pct": float(round(price_pct, 2))
+        },
+        "market_sentiment": ext_context, # ⬅️ APIで取得したTV判定とFear&Greed指数を追加
+        "strategy_status": {
+            "core_spot_position_pct": float(current_core_pct),
+            "core_action_detail": str(latest_core_action),
+            "overlay_long_pct": float(current_long_pct),
+            "overlay_short_pct": float(current_short_pct),
+            "overlay_status": str(overlay_status)
+        },
+        "technical_indicators": {
+            "MA7": float(round(latest_c_7, 2)),
+            "MA30": float(round(latest_c_30, 2)),
+            "MA90": float(round(latest_c_90, 2)),
+            "MA365": float(round(latest_c_365, 2)),
+            "MA1460": float(round(latest_c_1460, 2))
+        },
+        "strategy_conditions": {
+            "is_perfect_bull": bool(latest_cond_perfect_bull),
+            "is_perfect_bear": bool(latest_cond_perfect_bear),
+            "is_buy_gradual_phase": bool(latest_cond_buy_gradual),
+            "is_sell_gradual_phase": bool(latest_cond_sell_gradual),
+            "is_short_active": bool(is_short_mode_under_100)
+        },
+        "trigger_distances": {
+            "dist_MA7_vs_MA30_pct": float(round(dist_7_30, 2)),
+            "dist_MA7_vs_MA1460_pct": float(round(dist_7_1460, 2))
+        },
+        "system_kpi": {
+            "total_cagr_pct": float(round(total_cagr, 2)),
+            "total_max_drawdown_pct": float(round(total_mdd, 2))
+        },
+        "internal_timers": {
+            "short_hold_days": int(latest_short_hold_days),
+            "days_since_long_exit": int(latest_days_since_long_exit),
+            "is_long_penalty_active": bool(latest_long_penalty)
+        }
+    }
+    
+    json_str = json.dumps(ai_data, indent=4, ensure_ascii=False)
+    
+    prompt_template = f"""以下のJSONデータは、現在のBTC自動売買システムのステータスと外部市場データです。
+このデータを分析し、X(Twitter)用の相場分析ポストを作成してください。
+
+【厳守するルール】
+・「現在〇〇を保有している」「現状維持する」「離脱した」など、**実際の個人的なポジションやトレードの状況を連想させる表現は一切禁止**。
+・あくまで「システムが現在どういうシグナル（サイン）を出しているか」「推奨される市場の警戒レベル」として完全に客観的なアナリスト目線で記述すること。
+・文体は体言止めを用いて極力文字数を減らすこと。
+・「市場環境」「現在のシステムシグナル」「今後の注目トリガー」の3段落構成にすること。
+・今後の見通しには、`trigger_distances` のデータを用いて「あと約〇〇%変動すれば、新たなシグナルが点灯する」という予告を含めること。
+・`internal_timers` でペナルティや待機が発生している場合は、「システムは現在ダマシを警戒する冷却期間（待機シグナル）にある」といった表現に変換すること。
+・そのままXに投稿できるテキストのみを出力すること。
+
+【システム・市場データ】
+{json_str}
+"""
+
+    st.code(prompt_template, language="markdown")

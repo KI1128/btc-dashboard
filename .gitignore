@@ -1,0 +1,23 @@
+# Python関連
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+env.bak/
+venv.bak/
+
+# Streamlit設定 / 環境変数
+.streamlit/secrets.toml
+.env
+
+# データファイル (スクリプトによって自動生成・更新されるもの)
+btc_daily_dataset.csv
+*.csv
+
+# OSの一時ファイル
+.DS_Store
+Thumbs.db
