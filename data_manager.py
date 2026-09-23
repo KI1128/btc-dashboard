@@ -8,30 +8,22 @@ def fetch_and_update_data(output_path="data/btc_daily_dataset.csv"):
     os.makedirs(os.path.dirname(output_path) or "data", exist_ok=True)
     start_date = "2017-01-01"
 
-    # Yahoo FinanceからBTC-USDのデータを取得（米国サーバーでも制限なし & 2017年からの長期履歴を確保）
-    # yfinanceは非常に高速なため、差分ではなく毎回全期間を一括取得して完全同期します
     btc_df = yf.download("BTC-USD", start=start_date, interval="1d", progress=False)
 
-    # yfinanceのバージョンによるカラム構造（MultiIndex）の違いを吸収
     if isinstance(btc_df.columns, pd.MultiIndex):
         btc_df.columns = btc_df.columns.get_level_values(0)
 
     btc_df = btc_df.reset_index()
 
-    # システムで使うカラム名に統一
     btc_df = btc_df.rename(columns={
         "Date": "date", "Open": "open", "High": "high",
         "Low": "low", "Close": "close", "Volume": "volume"
     })
 
-    # 日付型に変換して時間情報を落とす
     btc_df["date"] = pd.to_datetime(btc_df["date"]).dt.date
     btc_df = btc_df[["date", "open", "high", "low", "close", "volume"]]
-
-    # 欠損値（取引休場日などのNaN）があれば前日の値で埋める
     btc_df = btc_df.ffill()
 
-    # CSVに保存して上書き
     btc_df.to_csv(output_path, index=False)
     return btc_df
 
@@ -40,7 +32,6 @@ def load_data(csv_path="data/btc_daily_dataset.csv"):
     df['date'] = pd.to_datetime(df['date'])
     df = df.sort_values('date').reset_index(drop=True)
 
-    # MAと勾配の計算
     ma_windows = [7, 30, 90, 365, 1460]
     for w in ma_windows:
         df[f'MA_{w}'] = df['close'].rolling(window=w).mean()
@@ -49,7 +40,6 @@ def load_data(csv_path="data/btc_daily_dataset.csv"):
     df['slope_30'] = df['MA_30'].diff()
     df['ma365_slope'] = df['MA_365'].diff(5)
     
-    # お天気用指標
     df['macro_spread'] = (df['MA_365'] - df['MA_1460']) / df['MA_1460'] * 100
     df['past_90d_return'] = df['close'].pct_change(periods=90) * 100
     df['future_90d_return'] = (df['close'].shift(-90) / df['close'] - 1.0) * 100
@@ -192,15 +182,32 @@ def calculate_weather(df):
         weights = 1 / (top_7['dist']**2 + 1e-8)
         today_exp_90d = (top_7['future_90d_return'] * (weights / weights.sum())).sum()
 
-    # 7日間予測 (乱数シミュ)
     recent_90d_returns = valid_xy_df['daily_return'].tail(90)
     mu, sigma = recent_90d_returns.mean(), recent_90d_returns.std()
     
-    sim_paths = [current_data['close'] * np.cumprod(1 + np.random.normal(mu, sigma, 7)) for _ in range(100)]
-    expected_prices_7d = np.mean(sim_paths, axis=0)
+    n_sims = 300 
     
-    future_dates = [current_data['date'] + datetime.timedelta(days=i) for i in range(1, 8)]
-    future_df = pd.DataFrame({'date': future_dates, 'close': expected_prices_7d})
+    # 4窓平均パス用（7日）
+    sim_returns_7d = np.random.normal(mu, sigma, (n_sims, 7))
+    sim_prices_7d = current_data['close'] * np.cumprod(1 + sim_returns_7d, axis=1)
+    
+    # 価格チャート用（90日）
+    sim_returns_90d = np.random.normal(mu, sigma, (n_sims, 90))
+    sim_prices_90d = current_data['close'] * np.cumprod(1 + sim_returns_90d, axis=1)
+    future_dates_90d = [current_data['date'] + datetime.timedelta(days=i) for i in range(1, 91)]
+    
+    # 価格チャート用の統計ライン計算
+    sim_prices_90d_arr = np.array(sim_prices_90d)
+    mean_path_90d = np.mean(sim_prices_90d_arr, axis=0).tolist()
+    median_path_90d = np.median(sim_prices_90d_arr, axis=0).tolist()
+    std_path_90d = np.std(sim_prices_90d_arr, axis=0)
+    upper_1sd_90d = (mean_path_90d + std_path_90d).tolist()
+    lower_1sd_90d = (mean_path_90d - std_path_90d).tolist()
+
+    # 4窓用 7日間の平均パス
+    expected_prices_7d = np.mean(sim_prices_7d, axis=0)
+    future_dates_7d = [current_data['date'] + datetime.timedelta(days=i) for i in range(1, 8)]
+    future_df = pd.DataFrame({'date': future_dates_7d, 'close': expected_prices_7d})
     
     temp_df = pd.concat([df[['date', 'close']], future_df], ignore_index=True)
     temp_df['MA_30'] = temp_df['close'].rolling(window=30).mean()
@@ -211,7 +218,24 @@ def calculate_weather(df):
     temp_df['past_90d_change'] = temp_df['close'].pct_change(periods=90) * 100
     
     future_7d_data = temp_df.iloc[-7:].copy()
+
+    # 🆕 4窓用の雲座標作成 (90日分に拡張！)
+    close_tail = df['close'].values[-1460:] 
+    cloud_x = []
+    cloud_y = []
     
+    for i in range(n_sims):
+        temp_close = np.concatenate((close_tail, sim_prices_90d[i]))
+        for j in range(90):  # 7日から90日に変更
+            idx = 1460 + j
+            c_365 = np.mean(temp_close[idx - 364 : idx + 1])
+            c_1460 = np.mean(temp_close[idx - 1459 : idx + 1])
+            spread = (c_365 - c_1460) / c_1460 * 100
+            c_90d_ago = temp_close[idx - 90]
+            ret_90d = (temp_close[idx] - c_90d_ago) / c_90d_ago * 100
+            cloud_x.append(spread)
+            cloud_y.append(ret_90d)
+            
     # 週間予報データの作成
     forecast_results = []
     for i, row in future_7d_data.iterrows():
@@ -253,5 +277,12 @@ def calculate_weather(df):
         "x_forecast": [current_data['macro_spread']] + future_7d_data['macro_spread'].tolist(),
         "y_forecast": [today_past_90d_change] + future_7d_data['past_90d_change'].tolist(),
         "sigma": sigma,
-        "forecast_results": forecast_results # 追加！
+        "forecast_results": forecast_results,
+        "cloud_x": cloud_x, "cloud_y": cloud_y,
+        "future_dates_90d": future_dates_90d, 
+        "sim_prices_90d": sim_prices_90d.tolist(),
+        "mean_path_90d": mean_path_90d,        # 追加：90日平均パス
+        "median_path_90d": median_path_90d,    # 追加：90日中央値パス
+        "upper_1sd_90d": upper_1sd_90d,        # 追加：90日+1σパス
+        "lower_1sd_90d": lower_1sd_90d         # 追加：90日-1σパス
     }

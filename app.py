@@ -1,13 +1,13 @@
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
-import matplotlib.pyplot as plt
+import plotly.subplots as sp
 import numpy as np
 import datetime
 import os
 from data_manager import fetch_and_update_data, load_data, calculate_strategy, calculate_weather
 
-st.set_page_config(page_title="BTC Dashboard", layout="wide")
+st.set_page_config(page_title="統合版 BTC Dashboard", layout="wide")
 
 st.markdown("""
     <style>
@@ -39,18 +39,12 @@ def init_data():
 with st.spinner("🔄 最新の市場データを同期中..."):
     df, strat, weather = init_data()
 
-st.title("🚀 BTC Dashboard")
+st.title("🚀 BTC 統合ダッシュボード")
 
-# ================================
-# タブ構成
-# ================================
-tab1, tab2, tab3 = st.tabs(["🏠 サマリー & お天気", "📈 ペイント対応チャート", "🧭 お天気4窓チャート"])
+tab1, tab2, tab3 = st.tabs(["🏠 サマリー & お天気", "📈 ペイント対応チャート", "🧭 お天気エビデンスデータ"])
 
 # --- タブ1: サマリー & お天気 ---
 with tab1:
-    # ---------------------------
-    # 1段目: 現在の推奨戦略
-    # ---------------------------
     st.header("🎯 1. 現在の推奨戦略")
     col1, col2 = st.columns(2)
     with col1:
@@ -77,12 +71,7 @@ with tab1:
     
     st.divider()
 
-    # ---------------------------
-    # 2段目: 本日のお天気予報
-    # ---------------------------
     st.header("🌤️ 2. 本日のお天気予報")
-    
-    # ボラティリティの判定（日次変動の標準偏差が3.5%以上なら警告表示）
     is_high_volatility = weather['sigma'] > 0.035
     if is_high_volatility:
         st.warning(f"⚠️ **【荒天注意】** 現在の市場はボラティリティが高くなっています（日次変動の標準偏差: {weather['sigma']*100:.1f}%）。荒れやすい相場展開にご注意ください。")
@@ -99,9 +88,6 @@ with tab1:
 
     st.divider()
 
-    # ---------------------------
-    # 3段目: 向こう1週間の天気
-    # ---------------------------
     st.header("📆 3. 向こう1週間の天気")
     cols = st.columns(7)
     for i, col in enumerate(cols):
@@ -119,7 +105,7 @@ with tab1:
 with tab2:
     st.subheader("📈 チャート & 移動平均線ボード")
     
-    col_ui1, col_ui2, col_ui3 = st.columns([2, 1, 1])
+    col_ui1, col_ui2, col_ui3, col_ui4 = st.columns([2, 1, 1, 1.5])
     with col_ui1:
         period_options = {"7日": 7, "30日": 30, "90日": 90, "1年": 365, "4年": 1460, "8年": 2920}
         selected_period = st.radio("表示期間を選択:", options=list(period_options.keys()), index=4, horizontal=True)
@@ -128,11 +114,50 @@ with tab2:
     with col_ui3:
         paint_dash = st.selectbox("📏 線のスタイル", ["solid (実線)", "dash (破線)", "dot (点線)"])
         dash_val = paint_dash.split(" ")[0]
+    with col_ui4:
+        st.markdown("<div style='margin-top: 30px;'></div>", unsafe_allow_html=True)
+        show_price_cloud = st.toggle("☁️ 90日先の予想パス（雲）と統計ラインを表示", value=False)
 
     display_days = period_options[selected_period]
     df_plot = df.iloc[-display_days:]
 
     fig = go.Figure()
+    
+    # 🆕 価格チャートの雲（メガホン状）と統計ラインを描画
+    if show_price_cloud:
+        cloud_x_concat = []
+        cloud_y_concat = []
+        base_date = df_plot['date'].iloc[-1]
+        base_price = df_plot['close'].iloc[-1]
+        
+        # 1. 雲 (300パス) の描画
+        for sim_path in weather['sim_prices_90d']:
+            cloud_x_concat.extend([base_date] + weather['future_dates_90d'] + [None])
+            cloud_y_concat.extend([base_price] + sim_path + [None])
+            
+        fig.add_trace(go.Scatter(
+            x=cloud_x_concat, y=cloud_y_concat, mode='lines',
+            line=dict(color='rgba(255, 0, 0, 0.02)', width=1), 
+            hoverinfo='skip', showlegend=False
+        ))
+
+        # 2. 統計ラインの描画
+        dates_with_base = [base_date] + weather['future_dates_90d']
+        
+        fig.add_trace(go.Scatter(
+            x=dates_with_base, y=[base_price] + weather['mean_path_90d'],
+            mode='lines', line=dict(color='red', width=2, dash='dash'), name='Mean (平均)'
+        ))
+        fig.add_trace(go.Scatter(
+            x=dates_with_base, y=[base_price] + weather['upper_1sd_90d'],
+            mode='lines', line=dict(color='rgba(255, 0, 0, 0.4)', width=1, dash='dash'), name='+1 SD (標準偏差)'
+        ))
+        fig.add_trace(go.Scatter(
+            x=dates_with_base, y=[base_price] + weather['lower_1sd_90d'],
+            mode='lines', line=dict(color='rgba(255, 0, 0, 0.4)', width=1, dash='dash'), name='-1 SD (標準偏差)'
+        ))
+
+    # メインの価格線とMA
     fig.add_trace(go.Scatter(x=df_plot['date'], y=df_plot['close'], mode='lines', name='BTC Price', line=dict(color='black', width=1.5)))
     fig.add_trace(go.Scatter(x=df_plot['date'], y=df_plot['MA_7'], mode='lines', name='MA(7)', line=dict(color='cyan', width=1)))
     fig.add_trace(go.Scatter(x=df_plot['date'], y=df_plot['MA_30'], mode='lines', name='MA(30)', line=dict(color='blue', width=1)))
@@ -142,8 +167,7 @@ with tab2:
 
     fig.update_layout(
         yaxis_type="log", height=600, 
-        margin=dict(l=0, r=0, t=50, b=0), # 上部ツールバー用にマージンを追加
-        # レジェンドをチャート下部中央に配置しツールチップとの被りを解消
+        margin=dict(l=0, r=0, t=50, b=0),
         legend=dict(orientation="h", yanchor="top", y=-0.1, xanchor="center", x=0.5),
         dragmode='pan',
         newshape=dict(line_color=paint_color, line_dash=dash_val, line_width=2) 
@@ -156,73 +180,164 @@ with tab2:
     }
     st.plotly_chart(fig, width='stretch', config=paint_config)
 
-# --- タブ3: お天気4窓チャート ---
+# --- タブ3: お天気エビデンスデータ ---
 with tab3:
-    st.subheader("🧭 マクロサイクル・エビデンスデータ (4窓)")
+    st.subheader("🧭 マクロサイクル・エビデンスデータ")
     
-    # --- 表示オプションのトグル ---
-    col_t1, col_t2 = st.columns(2)
+    col_t1, col_t2 = st.columns([2, 3])
     with col_t1:
-        show_trail = st.toggle("過去90日の軌跡を表示する", value=True)
+        view_mode = st.radio("🔍 表示モード:", ["4窓すべて", "Spring", "Summer", "Autumn", "Winter"], horizontal=True)
     with col_t2:
-        show_forecast = st.toggle("今後7日間の予想進路を表示する", value=True)
+        col_t2_1, col_t2_2 = st.columns(2)
+        with col_t2_1:
+            show_trail = st.toggle("過去90日の軌跡を表示", value=True)
+            show_forecast = st.toggle("今後90日間の予想（雲）を表示", value=True) # 表記変更
+        with col_t2_2:
+            if show_forecast:
+                # 🆕 90日分(点数13倍)になったため、デフォルトを0.010に調整
+                cloud_opacity = st.slider("☁️ 雲の濃さ調整", min_value=0.001, max_value=0.050, value=0.010, step=0.001, format="%.3f")
+            else:
+                cloud_opacity = 0.010
     
     plot_df = weather['valid_xy_df'].dropna(subset=['future_90d_return'])
-    trail_df = weather['valid_xy_df'].iloc[-91:] # 過去90日分を取得
+    trail_df = weather['valid_xy_df'].iloc[-91:] 
     
     mask_spring = (plot_df['MA_30'] > plot_df['MA_365']) & (plot_df['ma365_slope'] <= 0)
     mask_summer = (plot_df['MA_30'] > plot_df['MA_365']) & (plot_df['ma365_slope'] > 0)
     mask_autumn = (plot_df['MA_30'] <= plot_df['MA_365']) & (plot_df['ma365_slope'] > 0)
     mask_winter = (plot_df['MA_30'] <= plot_df['MA_365']) & (plot_df['ma365_slope'] <= 0)
 
-    # 💡 変更点: sharey=False にして、各窓のY軸スケールを独立（最適化）させる
-    fig_4, axes = plt.subplots(2, 2, figsize=(14, 8), sharex=True, sharey=False)
-    
     phases = [
-        (mask_spring, axes[0, 0], 'Spring [Bottom Reversal]'), (mask_summer, axes[0, 1], 'Summer [Bull Market]'),
-        (mask_autumn, axes[1, 0], 'Autumn [Peak Out]'), (mask_winter, axes[1, 1], 'Winter [Bear Market]')
+        (mask_spring, 1, 1, 'Spring'),
+        (mask_summer, 1, 2, 'Summer'),
+        (mask_autumn, 2, 1, 'Autumn'),
+        (mask_winter, 2, 2, 'Winter')
     ]
 
     target_is_gc = weather['current_data']['MA_30'] > weather['current_data']['MA_365']
     target_is_up = weather['current_data']['ma365_slope'] > 0
 
-    for mask, ax, title in phases:
+    is_subplot = (view_mode == "4窓すべて")
+
+    if is_subplot:
+        fig_4 = sp.make_subplots(
+            rows=2, cols=2,
+            subplot_titles=('Spring [Bottom Reversal]', 'Summer [Bull Market]',
+                            'Autumn [Peak Out]', 'Winter [Bear Market]'),
+            horizontal_spacing=0.06, vertical_spacing=0.10
+        )
+        active_phases = phases
+    else:
+        fig_4 = go.Figure()
+        active_phases = [p for p in phases if p[3] in view_mode]
+
+    def add_t(trace, r, c):
+        if is_subplot: fig_4.add_trace(trace, row=r, col=c)
+        else: fig_4.add_trace(trace)
+
+    for mask, row, col, season_name in active_phases:
         df_sub = plot_df[mask]
         
-        # 散布図の色（c）のスケールは統一（vmin=-60, vmax=80）したまま、Y軸（位置）だけ自動調整されます
-        ax.scatter(df_sub['macro_spread'], df_sub['past_90d_return'], 
-                   c=df_sub['future_90d_return'], cmap='coolwarm_r', alpha=0.6, edgecolors='w', s=40, vmin=-60, vmax=80)
+        add_t(
+            go.Scatter(
+                x=df_sub['macro_spread'], y=df_sub['past_90d_return'],
+                mode='markers',
+                marker=dict(
+                    color=df_sub['future_90d_return'],
+                    colorscale='RdBu', reversescale=False, cmin=-60, cmax=80,
+                    size=7, opacity=0.6, line=dict(width=0.5, color='white')
+                ),
+                text=df_sub['date'].astype(str),
+                hovertemplate="<b>%{text}</b><br>Macro Spread: %{x:.2f}%<br>Past 90D: %{y:.2f}%<br>Future 90D: %{marker.color:.2f}%<extra></extra>",
+                showlegend=False
+            ),
+            row, col
+        )
         
-        ax.axvline(0, color='black', linestyle='--', alpha=0.6)
-        ax.axhline(0, color='black', linestyle='--', alpha=0.6)
-        ax.set_title(title, fontsize=12)
-        
-        # 現在いる季節の窓にだけ、軌跡・現在地・予想進路を描画
-        if (target_is_gc == ('Spring' in title or 'Summer' in title)) and (target_is_up == ('Summer' in title or 'Autumn' in title)):
+        if is_subplot:
+            fig_4.add_hline(y=0, line_dash="dash", line_color="black", opacity=0.5, row=row, col=col)
+            fig_4.add_vline(x=0, line_dash="dash", line_color="black", opacity=0.5, row=row, col=col)
+        else:
+            fig_4.add_hline(y=0, line_dash="dash", line_color="black", opacity=0.5)
+            fig_4.add_vline(x=0, line_dash="dash", line_color="black", opacity=0.5)
+
+        if (target_is_gc == (season_name in ['Spring', 'Summer'])) and (target_is_up == (season_name in ['Summer', 'Autumn'])):
             
-            # 1. 過去90日の軌跡
             if show_trail:
                 sub_trail = trail_df[(trail_df['MA_30'] > trail_df['MA_365']) == target_is_gc]
                 if len(sub_trail) > 1:
-                    ax.scatter(sub_trail['macro_spread'], sub_trail['past_90d_return'], color='purple', s=12, alpha=0.6, zorder=4)
-                    
-            # 2. 今後7日間の予想進路
-            if show_forecast:
-                ax.plot(weather['x_forecast'], weather['y_forecast'], color='red', linestyle='--', linewidth=2, alpha=0.8, zorder=5)
-                daily_vol_pct = weather['sigma'] * 100
-                for i in range(1, 8):
-                    ax.scatter(weather['x_forecast'][i], weather['y_forecast'][i], color='red', s=20, alpha=0.9, zorder=6)
-                    radius = 5 + (8 * (daily_vol_pct * np.sqrt(i)))
-                    ax.scatter(weather['x_forecast'][i], weather['y_forecast'][i], color='none', edgecolors='red', 
-                               linewidth=1.5, linestyle=':', s=radius**2, alpha=0.6, zorder=6)
+                    add_t(
+                        go.Scatter(
+                            x=sub_trail['macro_spread'], y=sub_trail['past_90d_return'],
+                            mode='markers',
+                            marker=dict(color='purple', size=6, opacity=0.8),
+                            text=sub_trail['date'].astype(str),
+                            hovertemplate="<b>%{text}</b> (軌跡)<br>Spread: %{x:.2f}%<br>Past 90D: %{y:.2f}%<extra></extra>",
+                            showlegend=False
+                        ),
+                        row, col
+                    )
             
-            # 3. 現在地
-            ax.scatter(weather['current_data']['macro_spread'], weather['current_data']['past_90d_return'], 
-                       color='gold', edgecolors='black', marker='*', s=150, zorder=7)
+            if show_forecast:
+                # 90日分の雲
+                add_t(
+                    go.Scatter(
+                        x=weather['cloud_x'], y=weather['cloud_y'],
+                        mode='markers',
+                        marker=dict(color='red', size=8, opacity=cloud_opacity, line=dict(width=0)),
+                        hoverinfo='skip', showlegend=False
+                    ),
+                    row, col
+                )
+                
+                # 7日分の平均パス
+                add_t(
+                    go.Scatter(
+                        x=weather['x_forecast'], y=weather['y_forecast'],
+                        mode='lines', line=dict(color='red', width=2, dash='dash'),
+                        hoverinfo='skip', showlegend=False
+                    ),
+                    row, col
+                )
+                
+                # 7日分の各ノード
+                for i in range(1, 8):
+                    add_t(
+                        go.Scatter(
+                            x=[weather['x_forecast'][i]], y=[weather['y_forecast'][i]],
+                            mode='markers',
+                            marker=dict(color='red', size=7, line=dict(color='white', width=1)),
+                            text=[f"Day +{i}"],
+                            hovertemplate="<b>予想平均 %{text}</b><br>Spread: %{x:.2f}%<br>Past 90D: %{y:.2f}%<extra></extra>",
+                            showlegend=False
+                        ),
+                        row, col
+                    )
 
-    # 軸ラベルの設定（独立させた右側のグラフにもY軸の目盛り数値が自動表示されるようになります）
-    for ax in axes[-1, :]: ax.set_xlabel('Macro Spread: (MA365 - MA1460) / MA1460 (%)')
-    for ax in axes[:, 0]: ax.set_ylabel('Past 90-Day Return (%)')
+            add_t(
+                go.Scatter(
+                    x=[weather['current_data']['macro_spread']], y=[weather['current_data']['past_90d_return']],
+                    mode='markers',
+                    marker=dict(color='gold', size=16, symbol='star', line=dict(color='black', width=1)),
+                    text=["現在地 (Today)"],
+                    hovertemplate="<b>%{text}</b><br>Spread: %{x:.2f}%<br>Past 90D: %{y:.2f}%<extra></extra>",
+                    showlegend=False
+                ),
+                row, col
+            )
 
-    plt.tight_layout() 
-    st.pyplot(fig_4)
+    if is_subplot:
+        fig_4.update_layout(height=700, margin=dict(l=40, r=40, t=60, b=40), hovermode='closest')
+        fig_4.update_xaxes(title_text="Macro Spread (%)", row=2, col=1)
+        fig_4.update_xaxes(title_text="Macro Spread (%)", row=2, col=2)
+        fig_4.update_yaxes(title_text="Past 90-Day Return (%)", row=1, col=1)
+        fig_4.update_yaxes(title_text="Past 90-Day Return (%)", row=2, col=1)
+    else:
+        fig_4.update_layout(
+            title=f"🔎 {active_phases[0][3]} Phase (拡大表示)",
+            height=600, margin=dict(l=40, r=40, t=60, b=40), hovermode='closest',
+            xaxis_title="Macro Spread (%)",
+            yaxis_title="Past 90-Day Return (%)"
+        )
+
+    st.plotly_chart(fig_4, width='stretch')
