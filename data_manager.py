@@ -1,7 +1,4 @@
 import os
-import time
-import requests
-import ccxt
 import pandas as pd
 import yfinance as yf
 import datetime
@@ -9,42 +6,34 @@ import numpy as np
 
 def fetch_and_update_data(output_path="data/btc_daily_dataset.csv"):
     os.makedirs(os.path.dirname(output_path) or "data", exist_ok=True)
-    existing_df = None
     start_date = "2017-01-01"
-    
-    if os.path.exists(output_path):
-        existing_df = pd.read_csv(output_path)
-        if not existing_df.empty and 'date' in existing_df.columns:
-            existing_df['date'] = pd.to_datetime(existing_df['date']).dt.date
-            latest_date = existing_df['date'].max()
-            start_date = (latest_date - datetime.timedelta(days=7)).strftime("%Y-%m-%d")
 
-    exchange = ccxt.binanceus()
-    since = exchange.parse8601(f"{start_date}T00:00:00Z")
-    all_ohlcv = []
-    
-    while True:
-        ohlcv = exchange.fetch_ohlcv("BTC/USDT", timeframe="1d", since=since, limit=1000)
-        if len(ohlcv) == 0: break
-        all_ohlcv.extend(ohlcv)
-        since = ohlcv[-1][0] + 1
-        time.sleep(exchange.rateLimit / 1000)
+    # Yahoo FinanceからBTC-USDのデータを取得（米国サーバーでも制限なし & 2017年からの長期履歴を確保）
+    # yfinanceは非常に高速なため、差分ではなく毎回全期間を一括取得して完全同期します
+    btc_df = yf.download("BTC-USD", start=start_date, interval="1d", progress=False)
 
-    btc_df = pd.DataFrame(all_ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
-    btc_df["date"] = pd.to_datetime(btc_df["timestamp"], unit="ms", utc=True).dt.tz_convert("Asia/Tokyo").dt.date
+    # yfinanceのバージョンによるカラム構造（MultiIndex）の違いを吸収
+    if isinstance(btc_df.columns, pd.MultiIndex):
+        btc_df.columns = btc_df.columns.get_level_values(0)
+
+    btc_df = btc_df.reset_index()
+
+    # システムで使うカラム名に統一
+    btc_df = btc_df.rename(columns={
+        "Date": "date", "Open": "open", "High": "high",
+        "Low": "low", "Close": "close", "Volume": "volume"
+    })
+
+    # 日付型に変換して時間情報を落とす
+    btc_df["date"] = pd.to_datetime(btc_df["date"]).dt.date
     btc_df = btc_df[["date", "open", "high", "low", "close", "volume"]]
 
-    new_df = btc_df.sort_values("date").reset_index(drop=True)
-    
-    if existing_df is not None and not existing_df.empty:
-        df = pd.concat([existing_df, new_df], ignore_index=True)
-        df = df.drop_duplicates(subset="date", keep="last")
-    else:
-        df = new_df
-        
-    df = df.sort_values("date").reset_index(drop=True)
-    df.to_csv(output_path, index=False)
-    return df
+    # 欠損値（取引休場日などのNaN）があれば前日の値で埋める
+    btc_df = btc_df.ffill()
+
+    # CSVに保存して上書き
+    btc_df.to_csv(output_path, index=False)
+    return btc_df
 
 def load_data(csv_path="data/btc_daily_dataset.csv"):
     df = pd.read_csv(csv_path)
