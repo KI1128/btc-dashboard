@@ -175,7 +175,9 @@ with tab3:
     mask_autumn = (plot_df['MA_30'] <= plot_df['MA_365']) & (plot_df['ma365_slope'] > 0)
     mask_winter = (plot_df['MA_30'] <= plot_df['MA_365']) & (plot_df['ma365_slope'] <= 0)
 
-    fig_4, axes = plt.subplots(2, 2, figsize=(14, 8), sharex=True, sharey=True)
+    # 💡 変更点: sharey=False にして、各窓のY軸スケールを独立（最適化）させる
+    fig_4, axes = plt.subplots(2, 2, figsize=(14, 8), sharex=True, sharey=False)
+    
     phases = [
         (mask_spring, axes[0, 0], 'Spring [Bottom Reversal]'), (mask_summer, axes[0, 1], 'Summer [Bull Market]'),
         (mask_autumn, axes[1, 0], 'Autumn [Peak Out]'), (mask_winter, axes[1, 1], 'Winter [Bear Market]')
@@ -186,8 +188,11 @@ with tab3:
 
     for mask, ax, title in phases:
         df_sub = plot_df[mask]
+        
+        # 散布図の色（c）のスケールは統一（vmin=-60, vmax=80）したまま、Y軸（位置）だけ自動調整されます
         ax.scatter(df_sub['macro_spread'], df_sub['past_90d_return'], 
                    c=df_sub['future_90d_return'], cmap='coolwarm_r', alpha=0.6, edgecolors='w', s=40, vmin=-60, vmax=80)
+        
         ax.axvline(0, color='black', linestyle='--', alpha=0.6)
         ax.axhline(0, color='black', linestyle='--', alpha=0.6)
         ax.set_title(title, fontsize=12)
@@ -211,10 +216,11 @@ with tab3:
                     ax.scatter(weather['x_forecast'][i], weather['y_forecast'][i], color='none', edgecolors='red', 
                                linewidth=1.5, linestyle=':', s=radius**2, alpha=0.6, zorder=6)
             
-            # 3. 現在地（これは常に表示）
+            # 3. 現在地
             ax.scatter(weather['current_data']['macro_spread'], weather['current_data']['past_90d_return'], 
                        color='gold', edgecolors='black', marker='*', s=150, zorder=7)
 
+    # 軸ラベルの設定（独立させた右側のグラフにもY軸の目盛り数値が自動表示されるようになります）
     for ax in axes[-1, :]: ax.set_xlabel('Macro Spread: (MA365 - MA1460) / MA1460 (%)')
     for ax in axes[:, 0]: ax.set_ylabel('Past 90-Day Return (%)')
 
