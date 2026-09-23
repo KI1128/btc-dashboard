@@ -19,7 +19,7 @@ def fetch_and_update_data(output_path="data/btc_daily_dataset.csv"):
             latest_date = existing_df['date'].max()
             start_date = (latest_date - datetime.timedelta(days=7)).strftime("%Y-%m-%d")
 
-    exchange = ccxt.binance()
+    exchange = ccxt.binanceus()
     since = exchange.parse8601(f"{start_date}T00:00:00Z")
     all_ohlcv = []
     
