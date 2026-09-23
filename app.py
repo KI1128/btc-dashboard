@@ -1,709 +1,222 @@
 import streamlit as st
 import pandas as pd
-from streamlit_autorefresh import st_autorefresh
-import numpy as np
-import requests
-import os
-import time
-from datetime import datetime, timezone
 import plotly.graph_objects as go
-import streamlit.components.v1 as components
-from tradingview_ta import TA_Handler, Interval
+import matplotlib.pyplot as plt
+import numpy as np
+import datetime
+import os
+from data_manager import fetch_and_update_data, load_data, calculate_strategy, calculate_weather
 
-
-# ==========================================
-# 1. 設定 & 定数
-# ==========================================
-st.set_page_config(page_title="BTC Strategy Dashboard", layout="wide")
+st.set_page_config(page_title="BTC Dashboard", layout="wide")
 
 st.markdown("""
     <style>
-        /* 全体の上下余白をさらに狭く */
-        .block-container {
-            padding-top: 1rem;
-            padding-bottom: 0rem;
-        }
-        /* 見出しとメトリクスの間の余白を狭く */
-        h3 {
-            padding-bottom: 0rem !important;
-            margin-bottom: 0rem !important;
-        }
-        /* st.metric（数値表示部分）のサイズを少し小さくコンパクトに */
-        [data-testid="stMetricValue"] {
-            font-size: 1.8rem !important;
-        }
-        [data-testid="stMetricLabel"] {
-            font-size: 0.9rem !important;
-        }
+        .block-container { padding-top: 1rem; padding-bottom: 0rem; }
+        [data-testid="stMetricValue"] { font-size: 1.8rem !important; }
+        [data-testid="stMetricLabel"] { font-size: 0.9rem !important; }
     </style>
 """, unsafe_allow_html=True)
 
-st_autorefresh(interval=60000, limit=None, key="data_refresh")
-
-CSV_FILE = 'btc_daily_dataset.csv'
-SYMBOL = 'BTCUSDT'
-
-# ==========================================
-# 2. データ取得・更新ロジック (Binance API)
-# ==========================================
-def fetch_binance_klines(start_ts=None, limit=1000):
-    url = "https://api.binance.us/api/v3/klines"
-    params = {"symbol": SYMBOL, "interval": "1d", "limit": limit}
-    if start_ts:
-        params["startTime"] = int(start_ts)
-    res = requests.get(url, params=params)
-    res.raise_for_status()
-    return res.json()
-
-def format_klines(raw_data):
-    df = pd.DataFrame(raw_data, columns=[
-        'Open_time', 'Open', 'High', 'Low', 'Close', 'Volume',
-        'Close_time', 'Quote_asset_volume', 'Number_of_trades',
-        'Taker_buy_base', 'Taker_buy_quote', 'Ignore'
-    ])
-    df['Date'] = pd.to_datetime(df['Open_time'], unit='ms')
-    df.set_index('Date', inplace=True)
-    df = df[['Open', 'High', 'Low', 'Close', 'Volume']].astype(float)
-    return df
-
 @st.cache_data(ttl=3600)
-def load_and_update_data():
-    if not os.path.exists(CSV_FILE):
-        start_ts = 1502928000000 
-        all_data = []
-        while True:
-            data = fetch_binance_klines(start_ts=start_ts, limit=1000)
-            if not data: break
-            all_data.extend(data)
-            start_ts = data[-1][0] + 1
-            if len(data) < 1000: break
-            time.sleep(0.5)
-        df = format_klines(all_data)
-        df.to_csv(CSV_FILE)
-        return df
+def init_data():
+    csv_path = "data/btc_daily_dataset.csv"
+    needs_update = True
+    if os.path.exists(csv_path):
+        last_mod_time = datetime.datetime.fromtimestamp(os.path.getmtime(csv_path), datetime.timezone.utc)
+        now_utc = datetime.datetime.now(datetime.timezone.utc)
+        start_of_utc_today = datetime.datetime.combine(now_utc.date(), datetime.time.min, tzinfo=datetime.timezone.utc)
+        if last_mod_time >= start_of_utc_today:
+            needs_update = False
 
-    df = pd.read_csv(CSV_FILE, index_col='Date', parse_dates=True)
-    last_date = df.index[-1]
-    update_start_date = last_date - pd.Timedelta(days=7)
-    update_start_ts = int(update_start_date.timestamp() * 1000)
-    
-    new_data = fetch_binance_klines(start_ts=update_start_ts, limit=1000)
-    df_new = format_klines(new_data)
-    
-    df = df[df.index < df_new.index[0]]
-    df = pd.concat([df, df_new])
-    df.to_csv(CSV_FILE)
-    return df
-
-def get_realtime_price():
-    url = f"https://api.binance.us/api/v3/ticker/price?symbol={SYMBOL}"
-    res = requests.get(url)
-    return float(res.json()['price'])
-
-@st.cache_data(ttl=900)  # 15分間キャッシュしてAPIの負荷を軽減
-def fetch_external_market_context():
-    context_data = {}
-    
-    # ① TradingView テクニカル分析の自動取得
-    try:
-        btc_ta = TA_Handler(
-            symbol="BTCUSDT",
-            screener="crypto",
-            exchange="BINANCE",
-            interval=Interval.INTERVAL_1_DAY
-        )
-        analysis = btc_ta.get_analysis()
-        context_data['tradingview'] = {
-            "summary": analysis.summary,  # 例: {"RECOMMENDATION": "BUY", "BUY": 11, "SELL": 5, "NEUTRAL": 10}
-        }
-    except Exception as e:
-        context_data['tradingview'] = {"error": str(e)}
-
-    # ② Fear & Greed Index (市場の空気感) の自動取得
-    try:
-        fng_res = requests.get("https://api.alternative.me/fng/?limit=1").json()
-        fng_data = fng_res['data'][0]
-        context_data['fear_and_greed'] = {
-            "score": int(fng_data['value']),  # 0(極端な恐怖) 〜 100(極端な強欲)
-            "classification": fng_data['value_classification']
-        }
-    except Exception as e:
-        context_data['fear_and_greed'] = {"error": str(e)}
+    if needs_update:
+        fetch_and_update_data(csv_path)
         
-    return context_data
+    df = load_data(csv_path)
+    strat = calculate_strategy(df)
+    weather = calculate_weather(df)
+    return df, strat, weather
 
-# ==========================================
-# 3. 指標計算 & 戦略状態のシミュレーション
-# ==========================================
-def calculate_trigger_price(df, period_A, period_B):
-    sum_A_minus_1 = df['Close'].iloc[-(period_A - 1):].sum()
-    sum_B_minus_1 = df['Close'].iloc[-(period_B - 1):].sum()
-    if period_B == period_A: return 0
-    return (period_A * sum_B_minus_1 - period_B * sum_A_minus_1) / (period_B - period_A)
+with st.spinner("🔄 最新の市場データを同期中..."):
+    df, strat, weather = init_data()
 
-def calc_kpi(returns_series):
-    cum_returns = (1 + returns_series).cumprod()
-    if len(cum_returns) < 2:
-        return 0, 0, 0
-    days = (cum_returns.index[-1] - cum_returns.index[0]).days
-    if days == 0:
-        return 0, 0, 0
-    
-    cagr = (cum_returns.iloc[-1] ** (365.0 / days)) - 1
-    rolling_max = cum_returns.cummax()
-    drawdown = cum_returns / rolling_max - 1
-    mdd = drawdown.min()
-    calmar = cagr / abs(mdd) if mdd != 0 else 0
-    
-    return cagr * 100, mdd * 100, calmar
+st.title("🚀 BTC Dashboard")
 
-# ==========================================
-# 4. データ準備・バックテスト並行処理
-# ==========================================
-with st.spinner("データを同期中..."):
-    df_history = load_and_update_data()
-    current_price = get_realtime_price()
-    ext_context = fetch_external_market_context()
+# ================================
+# タブ構成
+# ================================
+tab1, tab2, tab3 = st.tabs(["🏠 サマリー & お天気", "📈 ペイント対応チャート", "🧭 お天気4窓チャート"])
 
-today = pd.Timestamp(datetime.now(timezone.utc).date())
-if today in df_history.index:
-    df_history.loc[today, 'Close'] = current_price
-else:
-    df_history.loc[today] = {'Open': current_price, 'High': current_price, 'Low': current_price, 'Close': current_price, 'Volume': 0}
-
-ma_windows = [7, 30, 90, 365, 1460]
-for w in ma_windows:
-    df_history[f'MA_{w}'] = df_history['Close'].rolling(window=w).mean()
-
-df_history['slope_7'] = df_history['MA_7'].diff()
-df_history['slope_30'] = df_history['MA_30'].diff()
-
-current_base = 1.0  
-current_short = 0.0
-is_short_mode_under_100 = False
-short_hold_days = 0 
-long_active = False
-days_since_long_exit = 999
-long_penalty = False
-
-# バックテスト用の履歴リスト
-core_weights = []
-long_weights = []
-short_weights = []
-
-# 現在のステータス保存用変数
-latest_cond_perfect_bull = False
-latest_cond_perfect_bear = False
-latest_cond_buy_gradual = False
-latest_cond_sell_gradual = False
-latest_short_cond_100 = False
-latest_c_close = latest_c_7 = latest_c_30 = latest_c_90 = latest_c_365 = latest_c_1460 = 0.0
-
-# --- オーバーレイの詳細ステータス保存用 ---
-latest_long_penalty = False
-latest_days_since_long_exit = 0
-latest_short_hold_days = 0
-latest_long_signal = False
-
-for i in range(len(df_history)):
-    c_close = df_history['Close'].iloc[i]
-    c_7 = df_history['MA_7'].iloc[i]
-    c_30 = df_history['MA_30'].iloc[i]
-    c_90 = df_history['MA_90'].iloc[i]
-    c_365 = df_history['MA_365'].iloc[i]
-    c_1460 = df_history['MA_1460'].iloc[i]
-    slope_7 = df_history['slope_7'].iloc[i]
-    slope_30 = df_history['slope_30'].iloc[i]
-    
-    new_base = current_base
-    target_long = 0.0
-    ideal_short = 0.0
-    signal_short = 0.0
-    
-    if pd.notna(c_1460) and pd.notna(slope_30):
-        cond_perfect_bull = (c_1460 < c_365 < c_90 < c_30 < c_7)
-        cond_perfect_bear = (c_7 < c_30 < c_90 < c_365 < c_1460)
-        cond_buy_gradual  = (c_7 < c_1460)
-        cond_sell_gradual = (c_1460 < min(c_7, c_30)) and (max(c_7, c_30) < c_365) and (c_365 < c_90)
-        
-        buyback_flag = cond_perfect_bull or cond_buy_gradual
-        sell_flag = cond_perfect_bear or cond_sell_gradual
-        
-        # 最終日のアクションと各指標の記録
-        if i == len(df_history) - 1:
-            latest_c_close, latest_c_7, latest_c_30, latest_c_90, latest_c_365, latest_c_1460 = c_close, c_7, c_30, c_90, c_365, c_1460
-            latest_cond_perfect_bull = cond_perfect_bull
-            latest_cond_perfect_bear = cond_perfect_bear
-            latest_cond_buy_gradual = cond_buy_gradual
-            latest_cond_sell_gradual = cond_sell_gradual
-            if cond_perfect_bull: latest_core_action = "🟢 Perfect Bull (100%維持)"
-            elif cond_perfect_bear: latest_core_action = "🔴 Perfect Bear (0%維持)"
-            elif cond_buy_gradual: latest_core_action = "🟡 1% 買い集め進行中"
-            elif cond_sell_gradual: latest_core_action = "🟠 3% 段階的売却中"
-            else: latest_core_action = "⚪ 現状維持 (条件不一致)"
-
-        if cond_perfect_bull: new_base = 1.0
-        elif cond_perfect_bear: new_base = 0.0
-        elif cond_buy_gradual: new_base = min(1.0, current_base + 0.01)
-        elif cond_sell_gradual: new_base = max(0.0, current_base - 0.03)
-            
-        current_base = new_base
-        
-        cap = (current_base / 2.0) + (1.0 - current_base)
-        
-        if current_base == 1.0:
-            is_short_mode_under_100 = False 
-            short_cond_100 = (slope_30 < 0) and (slope_7 < 0) and ((slope_30 - slope_7) > 0) and (c_close < c_90)
-            if i == len(df_history) - 1: latest_short_cond_100 = short_cond_100
-            
-            # --- ショート条件のタイマー処理（シグナル用） ---
-            if short_cond_100 and short_hold_days < 7:
-                signal_short = cap * 0.25 
-                short_hold_days += 1
-            else:
-                signal_short = 0.0
-                if not short_cond_100:
-                    short_hold_days = 0
-            
-            ideal_short = 0.0
-            
-            # 買戻しが完了して現物100%になった際、残存しているショートがあれば継続してゆっくり償却
-            if current_short > ideal_short:
-                current_short = max(ideal_short, current_short - 0.005)
-
-            # --- ロングのペナルティ（お預け）判定と特例 ---
-            if signal_short > 0.0:
-                long_penalty = False
-
-            strong_bull = (c_7 > c_30) and (c_30 > c_90)
-            if strong_bull:
-                long_penalty = False 
-
-            long_signal = (signal_short == 0.0) and (c_7 > c_30)
-            is_long_active_today = False
-
-            if long_signal:
-                if not long_active:
-                    if (days_since_long_exit <= 7) and not strong_bull:
-                        long_penalty = True
-                
-                if not long_penalty:
-                    # ショート償却中なら50%、完全に0なら100%
-                    if current_short > 0.0:
-                        target_long = 0.5
-                    else:
-                        target_long = 1.0
-                    is_long_active_today = True
-                else:
-                    target_long = 0.0
-            else:
-                target_long = 0.0
-            
-            # 状態の更新
-            if long_active and not is_long_active_today:
-                days_since_long_exit = 0  
-            elif not is_long_active_today:
-                days_since_long_exit += 1 
-                
-            long_active = is_long_active_today
-
-        else:
-            short_hold_days = 0 
-            long_active = False
-            days_since_long_exit = 999
-            long_penalty = False
-            
-            if i == len(df_history) - 1: latest_short_cond_100 = False
-            if sell_flag: is_short_mode_under_100 = True
-            if buyback_flag: is_short_mode_under_100 = False
-            
-            # 現物<100%時は最大100%までショートを積む
-            ideal_short = 1.0 if is_short_mode_under_100 else 0.0
-            target_long = 0.0
-                
-            if current_short < ideal_short: 
-                current_short = min(ideal_short, current_short + 0.015)
-            elif current_short > ideal_short: 
-                current_short = max(ideal_short, current_short - 0.005)
-            
-    core_weights.append(current_base)
-    long_weights.append(target_long)
-    short_weights.append(current_short)
-    
-    # 最終日の詳細ステータスをUI向けに保存
-    if i == len(df_history) - 1:
-        latest_long_penalty = long_penalty
-        latest_days_since_long_exit = days_since_long_exit
-        latest_short_hold_days = short_hold_days
-        latest_long_signal = (signal_short == 0.0) and (c_7 > c_30) if current_base == 1.0 else False
-
-# バックテストリターン計算
-df_history['Core_Weight'] = core_weights
-df_history['Long_Weight'] = long_weights
-df_history['Short_Weight'] = short_weights
-
-df_history['Core_Weight_Prev'] = df_history['Core_Weight'].shift(1).fillna(1.0)
-df_history['Long_Weight_Prev'] = df_history['Long_Weight'].shift(1).fillna(0.0)
-df_history['Short_Weight_Prev'] = df_history['Short_Weight'].shift(1).fillna(0.0)
-
-df_history['BTC_Return'] = df_history['Close'].pct_change().fillna(0)
-df_history['Core_Return'] = df_history['Core_Weight_Prev'] * df_history['BTC_Return']
-df_history['Long_Return'] = df_history['Long_Weight_Prev'] * df_history['BTC_Return']
-df_history['Short_Return'] = df_history['Short_Weight_Prev'] * -df_history['BTC_Return']
-df_history['Total_Return'] = df_history['Core_Return'] + df_history['Long_Return'] + df_history['Short_Return']
-
-# 状態の確定
-current_core_pct = current_base * 100
-current_long_pct = target_long * 100
-current_short_pct = current_short * 100
-
-if current_long_pct > 0: overlay_status = f"🔵 LONG ({current_long_pct:.1f}%)"
-elif current_short_pct > 0: overlay_status = f"🔴 SHORT ({current_short_pct:.1f}%)"
-else: overlay_status = "⚪ ニュートラル (0%)"
-
-# ==========================================
-# 5. アラート用トリガー距離の算出
-# ==========================================
-# --- ベース（現物）用トリガー ---
-trigger_7_1460 = calculate_trigger_price(df_history.iloc[:-1], 7, 1460)
-dist_7_1460 = (trigger_7_1460 - current_price) / current_price * 100
-
-trigger_7_30 = calculate_trigger_price(df_history.iloc[:-1], 7, 30)
-dist_7_30 = (trigger_7_30 - current_price) / current_price * 100
-
-# --- オーバーレイ（Long/Short）用トリガー ---
-if len(df_history) >= 31:
-    p_7_ago = df_history['Close'].iloc[-8]
-    p_30_ago = df_history['Close'].iloc[-31]
-    
-    trigger_slope7 = p_7_ago
-    trigger_slope30 = p_30_ago
-    trigger_slope_diff = (30 * p_7_ago - 7 * p_30_ago) / 23
-    trigger_price_90 = df_history['MA_90'].iloc[-2] if len(df_history) > 1 else current_price
-else:
-    trigger_slope7 = trigger_slope30 = trigger_slope_diff = trigger_price_90 = current_price
-
-warn_slope7_down = (current_price <= trigger_slope7 * 1.01)
-warn_slope30_down = (current_price <= trigger_slope30 * 1.01)
-warn_diff_down = (current_price <= trigger_slope_diff * 1.01)
-warn_ma90_down = (current_price <= trigger_price_90 * 1.05)
-
-short_initiation_danger = warn_slope7_down and warn_slope30_down and warn_diff_down and warn_ma90_down
-
-
-# ==========================================
-# 6. UI構築 (タブ分け)
-# ==========================================
-st.title("🚀 BTC Strategy Dashboard")
-
-tab1, tab2, tab3, tab4 = st.tabs(["📊 ダッシュボード", "📈 チャート", "🧪 戦術バックテスト", "🤖 データ出力"])
-
-# --- タブ1: ダッシュボード ---
+# --- タブ1: サマリー & お天気 ---
 with tab1:
-    st.write("表示設定:")
-    col_t1, col_t2, col_t3 = st.columns(3)
-    with col_t1:
-        show_action = st.toggle("推奨アクション", value=True)
-    with col_t2:
-        show_alert = st.toggle("アラート・モニター", value=True)
-    with col_t3:
-        show_tv = st.toggle("マーケット判定 (TradingView)", value=True)
+    # ---------------------------
+    # 1段目: 現在の推奨戦略
+    # ---------------------------
+    st.header("🎯 1. 現在の推奨戦略")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.metric(f"Core (現物): {strat['core_pct']:.0f}%", strat['core_action'])
+        if strat['long_pct'] > 0: overlay_status = f"🔵 LONG ({strat['long_pct']:.1f}%)"
+        elif strat['short_pct'] > 0: overlay_status = f"🔴 SHORT ({strat['short_pct']:.1f}%)"
+        else: overlay_status = "⚪ ニュートラル (0%)"
+        st.metric("Overlay (Long/Short)", overlay_status)
+    with col2:
+        status_df = pd.DataFrame({
+            "指標・条件": ["現在価格", "MA(7)", "MA(30)", "MA(90)", "MA(365)", "MA(1460)",
+                       "🟢 超強気 (MA1460<365<90<30<7)", "🔴 超弱気 (MA7<30<90<365<1460)",
+                       "🟡 買い集め (MA7 < MA1460)", "🟠 売却 (MA1460 < MA7/30 < 365 < 90)"],
+            "数値・ステータス": [
+                f"${strat['c_close']:,.2f}", f"${strat['c_7']:,.2f}", f"${strat['c_30']:,.2f}", 
+                f"${strat['c_90']:,.2f}", f"${strat['c_365']:,.2f}", f"${strat['c_1460']:,.2f}",
+                "成立" if strat['cond_perfect_bull'] else "不成立",
+                "成立" if strat['cond_perfect_bear'] else "不成立",
+                "成立" if strat['cond_buy_gradual'] else "不成立",
+                "成立" if strat['cond_sell_gradual'] else "不成立"
+            ]
+        })
+        st.table(status_df)
     
-    st.markdown("---")
+    st.divider()
 
-    # 1. 現在の推奨アクション (スイッチがONの時だけ表示)
-    if show_action:
-        st.markdown("### 現在の推奨アクション")
-        
-        prev_price = df_history['Close'].iloc[-2] if len(df_history) > 1 else current_price
-        price_diff = current_price - prev_price
-        price_pct = (price_diff / prev_price) * 100 if prev_price != 0 else 0
+    # ---------------------------
+    # 2段目: 本日のお天気予報
+    # ---------------------------
+    st.header("🌤️ 2. 本日のお天気予報")
+    
+    # ボラティリティの判定（日次変動の標準偏差が3.5%以上なら警告表示）
+    is_high_volatility = weather['sigma'] > 0.035
+    if is_high_volatility:
+        st.warning(f"⚠️ **【荒天注意】** 現在の市場はボラティリティが高くなっています（日次変動の標準偏差: {weather['sigma']*100:.1f}%）。荒れやすい相場展開にご注意ください。")
+    
+    col3, col4, col5 = st.columns(3)
+    with col3:
+        st.markdown(f"### トレンド: {weather['today_season']}")
+    with col4:
+        p90 = weather['today_past_90d_change']
+        st.markdown(f"**直近90日の動き:** <br> {'☀️' if p90 >= 0 else '🌧️'} <span style='color:{'black' if p90 >= 0 else 'red'}; font-size: 1.5em;'>{p90:+.2f}%</span>", unsafe_allow_html=True)
+    with col5:
+        e90 = weather['today_exp_90d']
+        st.markdown(f"**今後90日の見通し:** <br> {'↗️' if e90 >= 0 else '↘️'} <span style='color:{'black' if e90 >= 0 else 'red'}; font-size: 1.5em;'>{e90:+.2f}%</span>", unsafe_allow_html=True)
 
-        col1, col2, col3 = st.columns(3)
-        col1.metric("リアルタイム BTC価格", f"${current_price:,.2f}", f"{price_diff:+,.2f} ({price_pct:+.2f}%)")
-        col2.metric(f"Core (現物): {current_core_pct:.0f}%", latest_core_action, delta_color="off")
-        col3.metric("Overlay (Long/Short)", overlay_status)
-        
-        st.markdown("---")
+    st.divider()
 
-    # 2. 24時間 アラート・モニター (スイッチがONの時だけ表示)
-    if show_alert:
-        st.subheader("⚠️ 24時間 アラート・モニター")
-        
-        # -----------------------------------
-        # ベース（現物）戦略のアラート
-        # -----------------------------------
-        st.markdown("##### 📦 Core (現物) ポジション")
-        if latest_cond_perfect_bull:
-            st.success("✅【安全】現在、強気のパーフェクトオーダーが成立しています。現物100%ホールド推奨です。")
-            if abs(dist_7_30) <= 5.0:
-                st.warning(f"⚠️【警戒】MA7がMA30をデッドクロスする価格（${trigger_7_30:,.0f} / 残り {abs(dist_7_30):.1f}%）に接近しています。5%以内のためパーフェクトオーダー崩壊に警戒してください。")
-            else:
-                st.info(f"ℹ️ パーフェクトオーダー崩壊ライン（MA7 vs MA30）は ${trigger_7_30:,.0f}（距離: {abs(dist_7_30):.1f}%）です。")
-                
-        elif latest_cond_perfect_bear:
-            st.error("🚨【危険】現在、弱気のパーフェクトオーダーが成立しています。現物0%（全キャッシュ化）推奨です。")
-            if abs(dist_7_30) <= 5.0:
-                 st.warning(f"⚠️【警戒】下落トレンド脱出ライン（MA7 vs MA30）まで残り {abs(dist_7_30):.1f}% です。")
-            else:
-                 st.info(f"ℹ️ 下落トレンド脱出ライン（MA7 vs MA30）は ${trigger_7_30:,.0f}（距離: {abs(dist_7_30):.1f}%）です。")
-                 
-        elif latest_cond_buy_gradual:
-            st.info(f"ℹ️【買い集め】MA(7) < MA(1460) が成立中。毎日1%ずつ現物を買い集めるフェーズです。")
-            if abs(dist_7_1460) <= 5.0:
-                st.warning(f"⚠️【接近中】MA7がMA1460を上抜ける大局的な転換価格（${trigger_7_1460:,.0f} / 残り {abs(dist_7_1460):.1f}%）に接近しています。5%以内のため注視してください。")
-            else:
-                st.info(f"ℹ️ 買い集めフェーズ終了ライン（MA7 vs MA1460）は ${trigger_7_1460:,.0f}（距離: {abs(dist_7_1460):.1f}%）です。")
-                
-        elif latest_cond_sell_gradual:
-            st.warning("⚠️【段階的売却】下落トレンドの初期症状を検知しました。毎日3%ずつ現物を段階的に売却するフェーズです。")
-            if abs(dist_7_30) <= 5.0:
-                 st.warning(f"⚠️【警戒】トレンド好転の目安となるライン（MA7 vs MA30）まで残り {abs(dist_7_30):.1f}% です。")
-            else:
-                 st.info(f"ℹ️ トレンド好転の目安となるライン（MA7 vs MA30）は ${trigger_7_30:,.0f}（距離: {abs(dist_7_30):.1f}%）です。")
-        else:
-            st.success("✅【待機】現在、条件移行の主要トリガーラインからの距離は十分にあります。現状維持です。")
+    # ---------------------------
+    # 3段目: 向こう1週間の天気
+    # ---------------------------
+    st.header("📆 3. 向こう1週間の天気")
+    cols = st.columns(7)
+    for i, col in enumerate(cols):
+        res = weather['forecast_results'][i]
+        with col:
+            st.markdown(f"**{res['date'].strftime('%m/%d')}**")
+            st.caption("トレンド")
+            st.markdown(f"**{res['season']}**")
+            f_p90 = res['past_90d']
+            st.markdown(f"☀️ <span style='color:black'>+{f_p90:.1f}%</span>" if f_p90 >= 0 else f"🌧️ <span style='color:red'>{f_p90:.1f}%</span>", unsafe_allow_html=True)
+            f_f90 = res['future_90d']
+            st.markdown(f"↗️ <span style='color:black'>+{f_f90:.1f}%</span>" if f_f90 >= 0 else f"↘️ <span style='color:red'>{f_f90:.1f}%</span>", unsafe_allow_html=True)
 
-        # -----------------------------------
-        # オーバーレイ（Long/Short）戦略のアラート
-        # -----------------------------------
-        st.markdown("##### 🚀 Overlay (Long/Short) ポジション")
-        if current_base == 1.0:
-            if current_short > 0:
-                st.warning(f"🔄【ショート償却中】現物は100%に復帰しましたが、過去の残存ショートポジションを緩やかに償却中です。（残り: {current_short_pct:.1f}%）")
-                
-            if latest_short_cond_100 or latest_short_hold_days > 0:
-                st.info(f"ℹ️【内部シグナル】短期的な下落サインを検知しています（ロング制御用・実ショートなし / タイマー: {latest_short_hold_days}/7日）。")
-                
-            if current_long_pct > 0:
-                if current_short > 0:
-                    st.success(f"🟢【ロング (制限中)】上昇トレンド継続中ですが、ショート償却中のためロングは 50% に制限されています。")
-                else:
-                    st.success(f"🟢【ロング (フル展開)】上昇トレンド継続中です。ショートが完全にゼロになったため、ロングを 100% フルで展開しています。")
-                    
-                if short_initiation_danger:
-                    st.warning(f"⚠️【警戒】すべてのショート発動条件（MAの傾き悪化＋MA90割れ）が境界価格から1%(MA90は5%)以内に迫っています。急落によるロング強制解除に強く警戒してください。")
-            else:
-                if latest_long_signal and latest_long_penalty:
-                    st.info(f"⏳【ロング待機 (ペナルティ)】ロング条件は成立していますが、ダマシ回避のため解除後7日間のペナルティ期間中です。エントリーを保留しています。（経過: {latest_days_since_long_exit}日）")
-                else:
-                    st.info("⚪【ニュートラル】ロング条件(MA7 > MA30)を満たしていないため、オーバーレイは現在フラット（ポジションなし）です。")
-        else:
-            if is_short_mode_under_100:
-                st.warning("📉【ショート展開】下落トレンド入りに伴い、下落ヘッジのためのショートポジションを最大100%まで期間をかけて構築・維持しています。")
-                if abs(dist_7_1460) <= 5.0:
-                    st.warning(f"⚠️【警戒】買い戻し条件（MA7がMA1460を上抜ける）まで残り {abs(dist_7_1460):.1f}% です。ショートが解消モードに移行する可能性があります。")
-            else:
-                st.info("🔄【ショート償却】買い戻し条件が成立したため、ショートポジションを徐々に縮小・償却しています。")
-
-        # 各指標の折りたたみ表
-        with st.expander("🔍 各指標・条件判定の詳細データを見る", expanded=False):
-            status_df = pd.DataFrame({
-                "指標・条件": [
-                    "現在価格", "MA(7)", "MA(30)", "MA(90)", "MA(365)", "MA(1460)",
-                    "超強気フェーズ (MA1460<365<90<30<7)",
-                    "超弱気フェーズ (MA7<30<90<365<1460)",
-                    "買い集めフェーズ (MA7 < MA1460)",
-                    "売却・ロング禁止フェーズ (MA1460 < MA7/30 < 365 < 90)",
-                    "ショート移行条件成立（現物100%時はロング解除シグナル）"
-                ],
-                "数値・ステータス": [
-                    f"${latest_c_close:,.2f}", f"${latest_c_7:,.2f}", f"${latest_c_30:,.2f}", 
-                    f"${latest_c_90:,.2f}", f"${latest_c_365:,.2f}", f"${latest_c_1460:,.2f}",
-                    "🟢 成立" if latest_cond_perfect_bull else "❌ 不成立",
-                    "🔴 成立" if latest_cond_perfect_bear else "❌ 不成立",
-                    "🟡 成立" if latest_cond_buy_gradual else "❌ 不成立",
-                    "🟠 成立" if latest_cond_sell_gradual else "❌ 不成立",
-                    "🔴 成立" if is_short_mode_under_100 or latest_short_cond_100 else "❌ 不成立"
-                ]
-            })
-            st.table(status_df)
-            
-        st.markdown("---")
-
-    # 3. マーケット総合判定 (TradingView) (スイッチがONの時だけ表示)
-    if show_tv:
-        st.subheader("📈 マーケット総合判定 (TradingView)")
-        
-        tv_widget = """
-        <!-- TradingView Widget BEGIN -->
-        <div class="tradingview-widget-container">
-          <div class="tradingview-widget-container__widget"></div>
-          <script type="text/javascript" src="https://s3.tradingview.com/external-embedding/embed-widget-technical-analysis.js" async>
-          {
-          "interval": "1D",
-          "width": "100%",
-          "isTransparent": false,
-          "height": "500",
-          "symbol": "BINANCE:BTCUSDT",
-          "showIntervalTabs": true,
-          "displayMode": "multiple",
-          "locale": "ja",
-          "colorTheme": "light"
-        }
-          </script>
-        </div>
-        <!-- TradingView Widget END -->
-        """
-        components.html(tv_widget, height=520, scrolling=True)
-
-    if st.button("🔄 リアルタイムデータを更新"):
-        st.rerun()
-
-# --- タブ2: チャート ---
+# --- タブ2: ペイント対応チャート ---
 with tab2:
-    st.subheader("相場環境チャート")
-    period_options = {
-        "1週間": 7,
-        "1カ月": 30,
-        "3カ月": 90,
-        "1年": 365,
-        "4年": 1460
-    }
-
-    selected_period = st.radio("表示期間を選択:", options=list(period_options.keys()), index=4, horizontal=True)
+    st.subheader("📈 チャート & 移動平均線ボード")
+    
+    col_ui1, col_ui2, col_ui3 = st.columns([2, 1, 1])
+    with col_ui1:
+        period_options = {"7日": 7, "30日": 30, "90日": 90, "1年": 365, "4年": 1460, "8年": 2920}
+        selected_period = st.radio("表示期間を選択:", options=list(period_options.keys()), index=4, horizontal=True)
+    with col_ui2:
+        paint_color = st.color_picker("🎨 ペイントの色", "#FF0000")
+    with col_ui3:
+        paint_dash = st.selectbox("📏 線のスタイル", ["solid (実線)", "dash (破線)", "dot (点線)"])
+        dash_val = paint_dash.split(" ")[0]
 
     display_days = period_options[selected_period]
-    df_plot = df_history.iloc[-display_days:]
+    df_plot = df.iloc[-display_days:]
 
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=df_plot.index, y=df_plot['Close'], mode='lines', name='BTC Price', line=dict(color='black', width=1.5)))
-    fig.add_trace(go.Scatter(x=df_plot.index, y=df_plot['MA_7'], mode='lines', name='MA(7)', line=dict(color='cyan', width=1)))
-    fig.add_trace(go.Scatter(x=df_plot.index, y=df_plot['MA_30'], mode='lines', name='MA(30)', line=dict(color='blue', width=1)))
-    fig.add_trace(go.Scatter(x=df_plot.index, y=df_plot['MA_90'], mode='lines', name='MA(90)', line=dict(color='green', width=1)))
-    fig.add_trace(go.Scatter(x=df_plot.index, y=df_plot['MA_365'], mode='lines', name='MA(365)', line=dict(color='orange', width=1.5)))
-    fig.add_trace(go.Scatter(x=df_plot.index, y=df_plot['MA_1460'], mode='lines', name='MA(1460)', line=dict(color='purple', width=2, dash='dot')))
+    fig.add_trace(go.Scatter(x=df_plot['date'], y=df_plot['close'], mode='lines', name='BTC Price', line=dict(color='black', width=1.5)))
+    fig.add_trace(go.Scatter(x=df_plot['date'], y=df_plot['MA_7'], mode='lines', name='MA(7)', line=dict(color='cyan', width=1)))
+    fig.add_trace(go.Scatter(x=df_plot['date'], y=df_plot['MA_30'], mode='lines', name='MA(30)', line=dict(color='blue', width=1)))
+    fig.add_trace(go.Scatter(x=df_plot['date'], y=df_plot['MA_90'], mode='lines', name='MA(90)', line=dict(color='green', width=1)))
+    fig.add_trace(go.Scatter(x=df_plot['date'], y=df_plot['MA_365'], mode='lines', name='MA(365)', line=dict(color='orange', width=1.5)))
+    fig.add_trace(go.Scatter(x=df_plot['date'], y=df_plot['MA_1460'], mode='lines', name='MA(1460)', line=dict(color='purple', width=2, dash='dot')))
 
     fig.update_layout(
-        yaxis_type="log", 
-        height=500, 
-        margin=dict(l=0, r=0, t=30, b=0), 
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+        yaxis_type="log", height=600, 
+        margin=dict(l=0, r=0, t=50, b=0), # 上部ツールバー用にマージンを追加
+        # レジェンドをチャート下部中央に配置しツールチップとの被りを解消
+        legend=dict(orientation="h", yanchor="top", y=-0.1, xanchor="center", x=0.5),
+        dragmode='pan',
+        newshape=dict(line_color=paint_color, line_dash=dash_val, line_width=2) 
     )
-    st.plotly_chart(fig, use_container_width=True)
+    
+    paint_config = {
+        'modeBarButtonsToAdd': ['drawline', 'drawhline', 'drawvline', 'eraseshape'],
+        'displayModeBar': True,
+        'editable': True
+    }
+    st.plotly_chart(fig, width='stretch', config=paint_config)
 
-# --- タブ3: 戦術バックテスト ---
+# --- タブ3: お天気4窓チャート ---
 with tab3:
-    st.subheader("戦略の有効性検証")
+    st.subheader("🧭 マクロサイクル・エビデンスデータ (4窓)")
     
-    # 評価期間を直近の4年間 (1460日) に設定
-    bt_start = df_history.index[-1] - pd.Timedelta(days=1460)
-    df_bt = df_history.loc[bt_start:].copy()
+    # --- 表示オプションのトグル ---
+    col_t1, col_t2 = st.columns(2)
+    with col_t1:
+        show_trail = st.toggle("過去90日の軌跡を表示する", value=True)
+    with col_t2:
+        show_forecast = st.toggle("今後7日間の予想進路を表示する", value=True)
     
-    # KPIの計算
-    hodl_cagr, hodl_mdd, hodl_cal = calc_kpi(df_bt['BTC_Return'])
-    core_cagr, core_mdd, core_cal = calc_kpi(df_bt['Core_Return'])
-    long_cagr, long_mdd, long_cal = calc_kpi(df_bt['Long_Return'])
-    short_cagr, short_mdd, short_cal = calc_kpi(df_bt['Short_Return'])
-    total_cagr, total_mdd, total_cal = calc_kpi(df_bt['Total_Return'])
+    plot_df = weather['valid_xy_df'].dropna(subset=['future_90d_return'])
+    trail_df = weather['valid_xy_df'].iloc[-91:] # 過去90日分を取得
     
-    start_str = df_bt.index[0].strftime("%Y-%m-%d")
-    end_str = df_bt.index[-1].strftime("%Y-%m-%d")
-    
-    st.markdown(f"**評価期間:** {start_str} 〜 {end_str}")
-    
-    # KPIテーブル
-    kpi_data = {
-        "戦略": ["HODL (参考)", "Core (現物)", "Long (追撃)", "Short (空売)", "総合戦略"],
-        "CAGR (%)": [f"{hodl_cagr:.2f}%", f"{core_cagr:.2f}%", f"{long_cagr:.2f}%", f"{short_cagr:.2f}%", f"{total_cagr:.2f}%"],
-        "MDD (%)": [f"{hodl_mdd:.2f}%", f"{core_mdd:.2f}%", f"{long_mdd:.2f}%", f"{short_mdd:.2f}%", f"{total_mdd:.2f}%"],
-        "カルマーレシオ": [f"{hodl_cal:.2f}", f"{core_cal:.2f}", f"{long_cal:.2f}", f"{short_cal:.2f}", f"{total_cal:.2f}"]
-    }
-    
-    with st.expander("📊 パフォーマンス指標 (KPI) の詳細データを見る", expanded=False):
-        st.table(pd.DataFrame(kpi_data).set_index("戦略"))
-    
-    # 各戦略の累積資産推移を計算
-    df_bt['HODL_Cum'] = (1 + df_bt['BTC_Return']).cumprod()
-    df_bt['Core_Cum'] = (1 + df_bt['Core_Return']).cumprod()
-    df_bt['Long_Cum'] = (1 + df_bt['Long_Return']).cumprod()
-    df_bt['Short_Cum'] = (1 + df_bt['Short_Return']).cumprod()
-    df_bt['Total_Cum'] = (1 + df_bt['Total_Return']).cumprod()
-    
-    # グラフへの追加 (5本の線)
-    fig_bt = go.Figure()
-    fig_bt.add_trace(go.Scatter(x=df_bt.index, y=df_bt['HODL_Cum'], mode='lines', name='HODL (BTC)', line=dict(color='gray', dash='dash')))
-    fig_bt.add_trace(go.Scatter(x=df_bt.index, y=df_bt['Core_Cum'], mode='lines', name='Core (現物)', line=dict(color='orange', width=1)))
-    fig_bt.add_trace(go.Scatter(x=df_bt.index, y=df_bt['Long_Cum'], mode='lines', name='Long (追撃)', line=dict(color='cyan', width=1)))
-    fig_bt.add_trace(go.Scatter(x=df_bt.index, y=df_bt['Short_Cum'], mode='lines', name='Short (空売)', line=dict(color='purple', width=1)))
-    fig_bt.add_trace(go.Scatter(x=df_bt.index, y=df_bt['Total_Cum'], mode='lines', name='総合戦略', line=dict(color='red', width=2.5)))
-    
-    fig_bt.update_layout(
-        title="資産推移比較 (初期=1.0)",
-        yaxis_type="log",
-        height=450,
-        margin=dict(l=0, r=0, t=30, b=0),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
-    )
-    st.plotly_chart(fig_bt, use_container_width=True)
+    mask_spring = (plot_df['MA_30'] > plot_df['MA_365']) & (plot_df['ma365_slope'] <= 0)
+    mask_summer = (plot_df['MA_30'] > plot_df['MA_365']) & (plot_df['ma365_slope'] > 0)
+    mask_autumn = (plot_df['MA_30'] <= plot_df['MA_365']) & (plot_df['ma365_slope'] > 0)
+    mask_winter = (plot_df['MA_30'] <= plot_df['MA_365']) & (plot_df['ma365_slope'] <= 0)
 
-# --- タブ4: AI分析用データエクスポート ---
-with tab4:
-    st.subheader("🤖 分析用プロンプト生成")
-    st.write("以下のテキストをコピーしてAIに渡すだけで、市場の空気感を含めた高度な分析が完了します。")
-    
-    import json
-    
-    # AIが読み取りやすいように全データをJSONにまとめる
-    ai_data = {
-        "market_data": {
-            "symbol": "BTCUSDT",
-            "current_price": float(round(current_price, 2)),
-            "price_change_pct": float(round(price_pct, 2))
-        },
-        "market_sentiment": ext_context, # ⬅️ APIで取得したTV判定とFear&Greed指数を追加
-        "strategy_status": {
-            "core_spot_position_pct": float(current_core_pct),
-            "core_action_detail": str(latest_core_action),
-            "overlay_long_pct": float(current_long_pct),
-            "overlay_short_pct": float(current_short_pct),
-            "overlay_status": str(overlay_status)
-        },
-        "technical_indicators": {
-            "MA7": float(round(latest_c_7, 2)),
-            "MA30": float(round(latest_c_30, 2)),
-            "MA90": float(round(latest_c_90, 2)),
-            "MA365": float(round(latest_c_365, 2)),
-            "MA1460": float(round(latest_c_1460, 2))
-        },
-        "strategy_conditions": {
-            "is_perfect_bull": bool(latest_cond_perfect_bull),
-            "is_perfect_bear": bool(latest_cond_perfect_bear),
-            "is_buy_gradual_phase": bool(latest_cond_buy_gradual),
-            "is_sell_gradual_phase": bool(latest_cond_sell_gradual),
-            "is_short_active": bool(is_short_mode_under_100)
-        },
-        "trigger_distances": {
-            "dist_MA7_vs_MA30_pct": float(round(dist_7_30, 2)),
-            "dist_MA7_vs_MA1460_pct": float(round(dist_7_1460, 2))
-        },
-        "system_kpi": {
-            "total_cagr_pct": float(round(total_cagr, 2)),
-            "total_max_drawdown_pct": float(round(total_mdd, 2))
-        },
-        "internal_timers": {
-            "short_hold_days": int(latest_short_hold_days),
-            "days_since_long_exit": int(latest_days_since_long_exit),
-            "is_long_penalty_active": bool(latest_long_penalty)
-        }
-    }
-    
-    json_str = json.dumps(ai_data, indent=4, ensure_ascii=False)
-    
-    prompt_template = f"""以下のJSONデータは、現在のBTC自動売買システムのステータスと外部市場データです。
-このデータを分析し、X(Twitter)用の相場分析ポストを作成してください。
+    fig_4, axes = plt.subplots(2, 2, figsize=(14, 8), sharex=True, sharey=True)
+    phases = [
+        (mask_spring, axes[0, 0], 'Spring [Bottom Reversal]'), (mask_summer, axes[0, 1], 'Summer [Bull Market]'),
+        (mask_autumn, axes[1, 0], 'Autumn [Peak Out]'), (mask_winter, axes[1, 1], 'Winter [Bear Market]')
+    ]
 
-【厳守するルール】
-・「現在〇〇を保有している」「現状維持する」「離脱した」など、**実際の個人的なポジションやトレードの状況を連想させる表現は一切禁止**。
-・あくまで「システムが現在どういうシグナル（サイン）を出しているか」「推奨される市場の警戒レベル」として完全に客観的なアナリスト目線で記述すること。
-・文体は体言止めを用いて極力文字数を減らすこと。
-・「市場環境」「現在のシステムシグナル」「今後の注目トリガー」の3段落構成にすること。
-・今後の見通しには、`trigger_distances` のデータを用いて「あと約〇〇%変動すれば、新たなシグナルが点灯する」という予告を含めること。
-・`internal_timers` でペナルティや待機が発生している場合は、「システムは現在ダマシを警戒する冷却期間（待機シグナル）にある」といった表現に変換すること。
-・そのままXに投稿できるテキストのみを出力すること。
+    target_is_gc = weather['current_data']['MA_30'] > weather['current_data']['MA_365']
+    target_is_up = weather['current_data']['ma365_slope'] > 0
 
-【システム・市場データ】
-{json_str}
-"""
+    for mask, ax, title in phases:
+        df_sub = plot_df[mask]
+        ax.scatter(df_sub['macro_spread'], df_sub['past_90d_return'], 
+                   c=df_sub['future_90d_return'], cmap='coolwarm_r', alpha=0.6, edgecolors='w', s=40, vmin=-60, vmax=80)
+        ax.axvline(0, color='black', linestyle='--', alpha=0.6)
+        ax.axhline(0, color='black', linestyle='--', alpha=0.6)
+        ax.set_title(title, fontsize=12)
+        
+        # 現在いる季節の窓にだけ、軌跡・現在地・予想進路を描画
+        if (target_is_gc == ('Spring' in title or 'Summer' in title)) and (target_is_up == ('Summer' in title or 'Autumn' in title)):
+            
+            # 1. 過去90日の軌跡
+            if show_trail:
+                sub_trail = trail_df[(trail_df['MA_30'] > trail_df['MA_365']) == target_is_gc]
+                if len(sub_trail) > 1:
+                    ax.scatter(sub_trail['macro_spread'], sub_trail['past_90d_return'], color='purple', s=12, alpha=0.6, zorder=4)
+                    
+            # 2. 今後7日間の予想進路
+            if show_forecast:
+                ax.plot(weather['x_forecast'], weather['y_forecast'], color='red', linestyle='--', linewidth=2, alpha=0.8, zorder=5)
+                daily_vol_pct = weather['sigma'] * 100
+                for i in range(1, 8):
+                    ax.scatter(weather['x_forecast'][i], weather['y_forecast'][i], color='red', s=20, alpha=0.9, zorder=6)
+                    radius = 5 + (8 * (daily_vol_pct * np.sqrt(i)))
+                    ax.scatter(weather['x_forecast'][i], weather['y_forecast'][i], color='none', edgecolors='red', 
+                               linewidth=1.5, linestyle=':', s=radius**2, alpha=0.6, zorder=6)
+            
+            # 3. 現在地（これは常に表示）
+            ax.scatter(weather['current_data']['macro_spread'], weather['current_data']['past_90d_return'], 
+                       color='gold', edgecolors='black', marker='*', s=150, zorder=7)
 
-    st.code(prompt_template, language="markdown")
+    for ax in axes[-1, :]: ax.set_xlabel('Macro Spread: (MA365 - MA1460) / MA1460 (%)')
+    for ax in axes[:, 0]: ax.set_ylabel('Past 90-Day Return (%)')
+
+    plt.tight_layout() 
+    st.pyplot(fig_4)

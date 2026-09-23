@@ -4,3 +4,6 @@ streamlit-autorefresh
 numpy
 requests
 plotly
+ccxt
+yfinance
+matplotlib
